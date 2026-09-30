@@ -57,6 +57,10 @@ pub struct Worker {
 	/// the JavaScript but leaves the event loop waiting for a wake-up that never comes, and the
 	/// requests it holds hang until their wall clock.
 	stopping: Arc<tokio::sync::Notify>,
+	/// V8's heap in use, sampled on the worker's own thread every `SAMPLE` while its event loop
+	/// turns; with the allocator's ArrayBuffers, what the worker holds (`memory_bytes`).
+	heap_bytes: Arc<AtomicU64>,
+	budget: Arc<crate::v8_memory::Budget>,
 }
 
 impl Worker {
@@ -82,6 +86,11 @@ impl Worker {
 
 	/// How long this worker's thread has gone without its event loop turning: JavaScript that
 	/// has not yielded for that long.
+	/// What this worker holds: its heap as last sampled, and its ArrayBuffers now.
+	pub fn memory_bytes(&self) -> u64 {
+		self.heap_bytes.load(Ordering::Acquire) + u64::try_from(self.budget.held()).unwrap_or(u64::MAX)
+	}
+
 	pub fn stalled_ms(&self) -> u64 {
 		now_ms().saturating_sub(self.beat_ms.load(Ordering::Acquire))
 	}
@@ -162,6 +171,9 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 })"#;
 
 type Ready = oneshot::Sender<Result<Arc<Worker>, String>>;
+
+/// How often a serving worker records the memory its heap holds.
+const SAMPLE: Duration = Duration::from_millis(250);
 type Claim = (Spec, Ready);
 
 /// Isolates booted ahead of need, by heap limit (fixed when an isolate is created), each waiting
@@ -342,6 +354,7 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 	};
 	let stopping = Arc::new(tokio::sync::Notify::new());
 	let stopped_because = Arc::new(Mutex::new(None));
+	let heap_bytes = Arc::new(AtomicU64::new(0));
 	let handle = Arc::new(Worker {
 		label: spec.label.clone(),
 		socket: socket.clone(),
@@ -351,6 +364,8 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 		alive: alive.clone(),
 		stopped_because: stopped_because.clone(),
 		stopping: stopping.clone(),
+		heap_bytes: heap_bytes.clone(),
+		budget: budget.clone(),
 	});
 
 	{
@@ -443,15 +458,26 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 	debug!("{}: ready after {} us", spec.label, claimed_at.elapsed().as_micros());
 	let _ = ready.send(Ok(handle));
 
-	tokio::select! {
-		ended = worker.run_event_loop(false) => {
-			if let Err(error) = ended
-				&& stopped_because.lock().ok().and_then(|held| held.clone()).is_none()
-			{
-				eprintln!("{}: {error}", spec.label);
+	// The event loop, interrupted every `SAMPLE` to record the heap, which only this thread may
+	// read. A worker running JavaScript without yielding is not sampled, and is stopped by its CPU
+	// limit long before its heap has grown far.
+	let mut sample = tokio::time::interval(SAMPLE);
+	loop {
+		tokio::select! {
+			ended = worker.run_event_loop(false) => {
+				if let Err(error) = ended
+					&& stopped_because.lock().ok().and_then(|held| held.clone()).is_none()
+				{
+					eprintln!("{}: {error}", spec.label);
+				}
+				break;
+			}
+			() = stopping.notified() => break,
+			_ = sample.tick() => {
+				let used = worker.js_runtime.v8_isolate().get_heap_statistics().used_heap_size();
+				heap_bytes.store(u64::try_from(used).unwrap_or(u64::MAX), Ordering::Release);
 			}
 		}
-		() = stopping.notified() => {}
 	}
 	heartbeat.abort();
 	// Dropping the worker disposes of the isolate and closes its server, so every request it

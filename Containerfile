@@ -34,6 +34,11 @@ FROM scratch
 # glibc gives each thread that allocates its own arena, and every worker is a thread: two arenas
 # for the process took 1.5 MB off each warm worker (tests/memory-probe.sh).
 ENV MALLOC_ARENA_MAX=2
+# And allocations of 1 MB or more come from the system and go back to it when freed, rather than
+# glibc raising that threshold as it sees them freed and then keeping what a stopped worker held
+# (tests/memory-guard-probe.sh: without it, a process stayed at 99% of its cap after the worker
+# holding the memory was gone).
+ENV MALLOC_MMAP_THRESHOLD_=1048576
 COPY --from=rootfs /rootfs /
 EXPOSE 9000
 # How SnoutData Desktop's "Find databases" knows this container is part of the SnoutData stack

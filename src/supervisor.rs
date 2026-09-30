@@ -26,6 +26,8 @@
 //! the kernel's answer to a container over its cap is to kill the process, every project at once.
 //! So past `MEMORY_ROOM` of the cap a new worker starts only by stopping an idle one; with none
 //! idle, a request waits on a worker its function already has, or hears 503 and `Retry-After`.
+//! And past `MEMORY_GUARD`, when workers already running have grown, the one holding the most is
+//! stopped: its requests hear why, and the line it logs ("memory guard") is the one to watch for.
 
 use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::DefaultHasher;
@@ -48,6 +50,17 @@ const STALL_MS: u64 = 30;
 /// A worker costs ~7 MB before its function allocates (tests/memory-probe.sh), so this leaves a
 /// cap of 1 GB about 150 MB for the functions already running to grow into.
 const MEMORY_ROOM: u64 = 85;
+
+/// The share of the container's memory past which the worker holding the most is stopped, so one
+/// function pays for the host running short rather than the kernel killing every project. 90, not
+/// higher: memory is sampled every 100 ms and a heap every 250 ms, and a function allocating fast
+/// reached 98% of a 120 MB cap before a guard at 95 acted (tests/memory-guard-probe.sh). At most
+/// one a `GUARD_EVERY_MS`, which gives a stopped worker's memory time to come back, and only a
+/// worker holding at least `GUARD_SHARE` of the cap: past it the memory is elsewhere, and
+/// stopping a small worker would free nothing.
+const MEMORY_GUARD: u64 = 90;
+const GUARD_EVERY_MS: u64 = 1_000;
+const GUARD_SHARE: u64 = 20;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Key {
@@ -268,6 +281,7 @@ impl Supervisor {
 	pub async fn watch(self: Arc<Self>) {
 		let mut tick = tokio::time::interval(Duration::from_millis(20));
 		let mut sweeps: u64 = 0;
+		let mut guarded_ms: u64 = 0;
 		loop {
 			tick.tick().await;
 			sweeps += 1;
@@ -280,6 +294,10 @@ impl Supervisor {
 				self.memory_used.store(memory_used(cgroup), Ordering::Release);
 			}
 			let now = self.now_ms();
+			let over = self.memory_cap.and_then(|(cap, _)| {
+				let used = self.memory_used.load(Ordering::Acquire);
+				(used > cap / 100 * MEMORY_GUARD && now.saturating_sub(guarded_ms) > GUARD_EVERY_MS).then_some((used, cap))
+			});
 			let idle_ms = u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX);
 			let Ok(mut slots) = self.slots.lock() else { continue };
 			for held in slots.values_mut() {
@@ -308,6 +326,26 @@ impl Supervisor {
 				});
 			}
 			slots.retain(|_, held| !held.is_empty());
+			if let Some((used, cap)) = over {
+				let largest = slots
+					.values()
+					.flatten()
+					.filter_map(|slot| slot.get()?.as_ref().ok().cloned())
+					.filter(|entry| entry.worker.alive())
+					.max_by_key(|entry| entry.worker.memory_bytes())
+					.filter(|entry| entry.worker.memory_bytes() >= cap / GUARD_SHARE);
+				if let Some(entry) = largest {
+					eprintln!(
+						"{}: stopped by the memory guard, holding {} MB, with the container at {}% of its {} MB",
+						entry.worker.label,
+						entry.worker.memory_bytes() >> 20,
+						used * 100 / cap.max(1),
+						cap >> 20
+					);
+					entry.worker.stop("the host ran short of memory");
+					guarded_ms = now;
+				}
+			}
 		}
 	}
 }
