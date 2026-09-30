@@ -1,0 +1,112 @@
+# Its own workspace, not a member of packages/stack's (whose Cargo.toml excludes it): deno_runtime pins
+# some dependencies exactly, rustls among them through deno_tls, and one lockfile would hold storage,
+# Realtime and push to those pins. Its own lockfile, deny.toml and profiles, the same toolchain.
+[workspace]
+
+[package]
+name = "snout-functions"
+description = "snout-functions: the Snout Functions runtime, TypeScript on Deno's web platform in V8 isolates."
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/snoutdata"
+rust-version = "1.98.1"
+publish = false
+
+[[bin]]
+name = "snout-functions"
+path = "src/main.rs"
+
+[dependencies]
+# The JavaScript runtime: V8 through deno_core, with Deno's web platform and Node compatibility
+# (deno_runtime), booted from the snapshot deno_snapshots builds for exactly this deno_runtime.
+# All MIT (THIRD-PARTY-NOTICES.md). The versions move together: deno_snapshots 0.74 is built from
+# deno_runtime 0.267, which is built on deno_core 0.412.
+deno_runtime = "=0.267.0"
+deno_snapshots = "=0.74.0"
+deno_core = "=0.412.0"
+deno_resolver = "=0.90.0"
+node_resolver = "=0.97.0"
+url = "2"
+sys_traits = { version = "0.1.28", features = ["real", "getrandom", "libc", "winapi"] }
+
+deno_error = "=0.7.1"
+# TypeScript is stripped of its types when a module is loaded (no type check).
+deno_ast = { version = "=0.53.3", features = ["transpiling"] }
+
+# The port the front door calls, and the proxy to each worker's own server.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+# Response compression by the rules Deno's own HTTP server applies (src/compress.rs).
+flate2 = "1"
+brotli = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+# deno_snapshots builds its snapshot in a build script, and under resolver 3 a build script's
+# dependencies get their features resolved apart from the binary's: deno_runtime asks for deno_core
+# without its default `v8` feature, so nothing in the build context would enable an engine at all.
+# This one line is what turns V8 on there; build.rs is empty and exists only so it counts.
+deno_core = "=0.412.0"
+
+# The workspace forbids unsafe code outright (X13). This crate DENIES it instead, which is the same
+# everywhere but src/v8_memory.rs: the V8 embedding boundary, as pgrx is the Postgres one. The rest
+# of the workspace's lints are repeated here, because a crate that sets its own cannot also inherit.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# The shared workspace's profiles, repeated (a workspace of its own does not inherit them).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+# Unwind, not abort (the other components abort): a panic in one worker's thread must end that
+# worker, never the process serving every other project on the host.
+panic = "unwind"
+
+# Optimised for size, except what every request runs through: our own crate (not matched by "*"),
+# the server and the proxy, deno_core's op dispatch, Deno's HTTP server, fetch, streams and the
+# V8 bindings, and the compressors. The rest (Node compatibility, crypto, WebGPU, the TypeScript
+# stripper run once a cold start) is most of the binary and none of the hot path.
+[profile.release.package."*"]
+opt-level = "s"
+[profile.release.package.tokio]
+opt-level = 3
+[profile.release.package.hyper]
+opt-level = 3
+[profile.release.package.hyper-util]
+opt-level = 3
+[profile.release.package.deno_core]
+opt-level = 3
+[profile.release.package.serde_v8]
+opt-level = 3
+[profile.release.package.v8]
+opt-level = 3
+[profile.release.package.deno_http]
+opt-level = 3
+[profile.release.package.deno_fetch]
+opt-level = 3
+[profile.release.package.deno_web]
+opt-level = 3
+[profile.release.package.brotli]
+opt-level = 3
+[profile.release.package.flate2]
+opt-level = 3
+
+# For iterating on a build host: release speed without fat LTO. Reported numbers come from release.
+[profile.fast]
+inherits = "release"
+lto = "off"
+codegen-units = 16
+incremental = true
