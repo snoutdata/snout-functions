@@ -34,7 +34,7 @@ and wall-clock limits its project's plan sets. Written in Rust on `deno_runtime`
 - **Imports resolved before a request.** A bundle's `npm:`, `jsr:` and URL imports are resolved
   into one file when the host prepares it, never on a caller's request; TypeScript is stripped of
   its types when a module loads (no type check).
-- **Weighed, not only counted.** Every project on the host shares one container and its memory cap, and a container over its cap is killed whole. Past 85% of the cap a new worker starts only by stopping an idle one (40 functions under an 80 MB cap, each called twice: all 80 answered, peak 79 MB; uncapped, 392 MB).
+- **Weighed, not only counted.** Every project on the host shares one container and its memory cap, and a container over its cap is killed whole. Past 85% of the cap a new worker starts only by stopping an idle one (40 functions under an 80 MB cap, each called twice: all 80 answered, peak 79 MB; uncapped, 392 MB). Past 90%, the worker holding the most is stopped and the log says which and why, so one function that keeps growing costs itself its worker rather than every project the container (a 120 MB cap: stopped at 91%, peak 109 MB, the others still answering).
 - **Replies compressed where the client asks** (gzip, brotli), by the same rules for every
   function.
 - **Stops gracefully.** SIGTERM stops accepting and lets requests in flight finish.
@@ -70,6 +70,7 @@ snout-functions start [--port 9000] [--root /snoutfn] [--sockets <dir>] [--main-
 | `SNOUT_FUNCTIONS_V8_FLAGS` | none | no | Space-separated V8 flags, after the runtime's own (`--minor-ms --optimize-for-size`), which they override |
 | `SNOUT_FUNCTIONS_DEBUG` | off | no | Set to anything: a line on stderr per worker start, claim (with its timings), stop and limit decision |
 | `MALLOC_ARENA_MAX` | `2` in the image | no | glibc's arenas; more costs about 1.5 MB a warm worker |
+| `MALLOC_MMAP_THRESHOLD_` | `1048576` in the image | no | Allocations of 1 MB or more go back to the system when freed, so a stopped worker's memory leaves the process |
 
 ## What it reads
 

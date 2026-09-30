@@ -54,6 +54,11 @@ impl Budget {
 		}
 	}
 
+	/// The ArrayBuffer memory this isolate holds now.
+	pub fn held(&self) -> usize {
+		self.held.load(Ordering::Acquire)
+	}
+
 	fn release(&self, len: usize) {
 		self.held.fetch_sub(len, Ordering::AcqRel);
 	}
