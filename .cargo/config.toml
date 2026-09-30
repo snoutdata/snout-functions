@@ -1,0 +1,4 @@
+# zlib linked in, not loaded: the image carries only libc, libm, libgcc_s and the loader, and no libz
+# (rc1 would not start: "libz.so.1: cannot open shared object file").
+[env]
+LIBZ_SYS_STATIC = "1"

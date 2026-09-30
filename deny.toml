@@ -1,0 +1,78 @@
+# snout-functions' own cargo-deny policy: packages/stack/deny.toml, plus what its V8 runtime brings.
+# Everything added below says why; the target is to shed most of it when the runtime composes its
+# own, leaner set of Deno extensions.
+
+# What a dependency may be (X13, Q5). Run by scripts/check.sh and the pre-push hook.
+
+[graph]
+all-features = true
+
+# Every licence here is compatible with shipping the stack under Apache-2.0. A copyleft
+# licence (GPL, AGPL, LGPL, MPL, SSPL) or a source-available one (BSL, Elastic) fails the
+# check: a dependency must never dictate the stack's own licence (Q5).
+[licenses]
+allow = [
+	"MIT",
+	"MIT-0",
+	"Apache-2.0",
+	"Apache-2.0 WITH LLVM-exception",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"ISC",
+	"Zlib",
+	"Unicode-3.0",
+	"CDLA-Permissive-2.0",
+	"PostgreSQL",
+	# Permissive: Boost (clipboard-win, error-code), public domain (hexf-parse, notify, tiny-keccak),
+	# bzip2's own (libbz2-rs-sys).
+	"BSL-1.0", # the Boost licence, not the Business Source Licence refused above
+	"CC0-1.0",
+	"bzip2-1.0.6",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+# MPL-2.0 is file-level copyleft: fine unmodified under Apache-2.0, named one by one so no new one
+# arrives unnoticed. All come with deno_runtime's full extension set (CSS parsing for canvas).
+exceptions = [
+	{ name = "cssparser", allow = ["MPL-2.0"] },
+	{ name = "cssparser-macros", allow = ["MPL-2.0"] },
+	{ name = "dtoa-short", allow = ["MPL-2.0"] },
+	{ name = "cooked-waker", allow = ["MPL-2.0"] },
+	{ name = "smartstring", allow = ["MPL-2.0"] },
+]
+
+# libuv-sys-lite (libuv bindings deno_node uses) names its licence by file, not expression; the
+# file is the MIT licence (read 2026-09-28). The hash pins that file, so a changed one is noticed.
+[[licenses.clarify]]
+crate = "libuv-sys-lite"
+expression = "MIT"
+license-files = [{ path = "LICENSE", hash = 0xc2efc575 }]
+
+# Known vulnerabilities and unmaintained crates, from the RustSec database.
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+# Known, with no upgrade we can make: each arrives through a dependency deno_runtime 0.267 pins.
+# Revisit on every deno_runtime bump; remove an entry the moment its fix is reachable.
+ignore = [
+	# rustls 0.23.40, pinned exactly by deno_tls: a TLS 1.3 client accepting handshake messages
+	# across encryption levels. Outbound fetch from customer code is the only TLS client here.
+	{ id = "RUSTSEC-2026-0285", reason = "pinned =0.23.40 by deno_tls 0.246; fixed in 0.23.45" },
+	# hickory-proto 0.25: only deno_fetch's optional hickory resolver uses it, and ours is the
+	# system (getaddrinfo) resolver.
+	{ id = "RUSTSEC-2026-0118", reason = "hickory resolver not used: fetch resolves with getaddrinfo" },
+	{ id = "RUSTSEC-2026-0119", reason = "hickory resolver not used: fetch resolves with getaddrinfo" },
+	# rsa (Marvin): no fixed release exists. Reached only by node:crypto RSA decryption a
+	# customer calls on their own keys, inside their own isolate.
+	{ id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; customer-invoked node:crypto only" },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+# Crates come from crates.io and nowhere else. A git dependency is a decision, made here.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
