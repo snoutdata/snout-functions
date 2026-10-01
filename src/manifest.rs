@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
 	#[serde(default)]
@@ -24,7 +24,7 @@ pub struct Manifest {
 	pub env: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Deployed {
 	pub name: String,
@@ -51,7 +51,7 @@ impl Manifest {
 
 /// A project's limits, per invocation. The defaults are what a manifest without `limits` has
 /// always meant.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Limits {
 	pub memory_mb: u32,
@@ -74,33 +74,70 @@ impl Limits {
 	}
 }
 
-/// Manifests, cached by the file's modification time: exact, unlike a TTL, and cheaper than
-/// re-reading a file with secrets in it on every invocation.
+/// Where a process's manifests come from.
+///
+/// The front process reads the files the host agent writes, cached by each file's modification
+/// time: exact, unlike a TTL, and cheaper than re-reading a file with secrets in it on every
+/// invocation. A project's own process is HANDED its one manifest by the front process and can
+/// read no file of any other project's (project.rs), so it holds that one in memory.
 pub struct Manifests {
-	root: PathBuf,
-	held: Mutex<HashMap<String, (SystemTime, Manifest)>>,
+	bundles: PathBuf,
+	source: Source,
+}
+
+enum Source {
+	Files { root: PathBuf, held: Mutex<HashMap<String, (SystemTime, Manifest)>> },
+	Held(Mutex<Option<(String, Manifest)>>),
 }
 
 impl Manifests {
 	pub fn new(root: PathBuf) -> Self {
-		Manifests { root, held: Mutex::new(HashMap::new()) }
+		Manifests { bundles: root.join("bundles"), source: Source::Files { root, held: Mutex::new(HashMap::new()) } }
+	}
+
+	/// One project's manifest, held rather than read, with its bundles under `bundles`.
+	pub fn held(bundles: PathBuf, project: &str, manifest: Manifest) -> Self {
+		Manifests { bundles, source: Source::Held(Mutex::new(Some((project.to_owned(), manifest)))) }
+	}
+
+	/// Replace a held manifest (a changed secret, limit or deployment reaches the next request).
+	pub fn set(&self, manifest: Manifest) {
+		if let Source::Held(held) = &self.source
+			&& let Ok(mut held) = held.lock()
+			&& let Some((_, current)) = held.as_mut()
+		{
+			*current = manifest;
+		}
 	}
 
 	pub fn bundle_dir(&self, digest: &str) -> PathBuf {
-		self.root.join("bundles").join(digest)
+		self.bundles.join(digest)
+	}
+
+	/// The manifest's file and its modification time: what the front process watches for change.
+	pub fn stamp(&self, project: &str) -> Option<SystemTime> {
+		match &self.source {
+			Source::Files { root, .. } => std::fs::metadata(root.join("projects").join(format!("{project}.json"))).and_then(|m| m.modified()).ok(),
+			Source::Held(_) => None,
+		}
 	}
 
 	pub fn get(&self, project: &str) -> Option<Manifest> {
-		let path = self.root.join("projects").join(format!("{project}.json"));
-		let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-		if let Some((held_stamp, manifest)) = self.held.lock().ok()?.get(project)
-			&& *held_stamp == stamp
-		{
-			return Some(manifest.clone());
+		match &self.source {
+			Source::Held(held) => held.lock().ok()?.as_ref().filter(|(owner, _)| owner == project).map(|(_, manifest)| manifest.clone()),
+			Source::Files { root, held } => {
+				let path = root.join("projects").join(format!("{project}.json"));
+				let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+				if let Some((held_stamp, manifest)) = held.lock().ok()?.get(project)
+					&& *held_stamp == stamp
+				{
+					return Some(manifest.clone());
+				}
+				let manifest = read(&path)?;
+				held.lock().ok()?.insert(project.to_owned(), (stamp, manifest.clone()));
+				Some(manifest)
+			}
 		}
-		let manifest = read(&path)?;
-		self.held.lock().ok()?.insert(project.to_owned(), (stamp, manifest.clone()));
-		Some(manifest)
 	}
 }
 

@@ -24,12 +24,13 @@ cat > "$root/projects/$ref.json" <<JSON
 { "ref": "$ref", "functions": [ ${functions%,} ], "limits": { "memoryMb": 128, "wallMs": 30000, "cpuMs": 2000 }, "env": {} }
 JSON
 
-SNOUT_FUNCTIONS_DEBUG=1 SNOUT_FUNCTIONS_MEMORY_MB="$cap" "$bin" start --main-service /ignored --port "$port" --root "$root" --sockets "$root/sockets" > "$root/server.log" 2>&1 &
+MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=1048576 SNOUT_FUNCTIONS_DEBUG=1 SNOUT_FUNCTIONS_MEMORY_MB="$cap" "$bin" start --main-service /ignored --port "$port" --root "$root" --sockets "$root/sockets" > "$root/server.log" 2>&1 &
 server=$!
 trap 'kill $server 2>/dev/null; wait $server 2>/dev/null; rm -rf "$root"' EXIT
 for _ in $(seq 1 200); do curl -sf "http://127.0.0.1:$port/_snoutpod/health" >/dev/null && break; sleep 0.05; done
 
-anon() { awk '/^RssAnon/ { print int($2 / 1024) }' "/proc/$server/status"; }
+# The server and every process it started (a process per project since 0.2.0).
+anon() { for p in $server $(pgrep -P "$server"); do cat "/proc/$p/status" 2>/dev/null; done | awk '/^RssAnon/ { kb += $2 } END { print int(kb / 1024) }'; }
 peak=0; codes=""
 for round in 1 2; do
 	for i in $(seq 1 "$n"); do

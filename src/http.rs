@@ -27,7 +27,7 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::time::{Instant, Sleep};
 
 use crate::manifest::{self, Manifests};
@@ -38,8 +38,8 @@ pub const HEALTH_PATH: &str = "/_snoutpod/health";
 pub const DOOR_HEADER: &str = "x-snoutdata-door";
 pub const DOOR_ENV: &str = "SNOUT_FUNCTIONS_DOOR_SECRET";
 
-type Error = Box<dyn std::error::Error + Send + Sync>;
-type Reply = Response<BoxBody<Bytes, Error>>;
+pub type Error = Box<dyn std::error::Error + Send + Sync>;
+pub type Reply = Response<BoxBody<Bytes, Error>>;
 
 pub struct State {
 	pub manifests: Manifests,
@@ -50,7 +50,7 @@ pub struct State {
 
 /// Whether a request carries the door's secret, compared in time that does not depend on
 /// where the two first differ.
-fn through_door(presented: Option<&[u8]>, door: &[u8]) -> bool {
+pub fn through_door(presented: Option<&[u8]>, door: &[u8]) -> bool {
 	let Some(presented) = presented else { return false };
 	if presented.len() != door.len() {
 		return false;
@@ -68,18 +68,32 @@ pub async fn serve(listener: TcpListener, state: Arc<State>) {
 			}
 		};
 		let _ = stream.set_nodelay(true);
-		let state = state.clone();
-		tokio::spawn(async move {
-			let service = service_fn(move |request| {
-				let state = state.clone();
-				async move { Ok::<_, Infallible>(route(request, state).await) }
-			});
-			let _ = hyper::server::conn::http1::Builder::new()
-				.serve_connection(TokioIo::new(stream), service)
-				.with_upgrades()
-				.await;
-		});
+		tokio::spawn(connection(stream, state.clone()));
 	}
+}
+
+/// A project's own process: the front process is the only caller, on a socket in a directory only
+/// the two of them can reach (router.rs).
+pub async fn serve_unix(listener: UnixListener, state: Arc<State>) {
+	loop {
+		match listener.accept().await {
+			Ok((stream, _)) => {
+				tokio::spawn(connection(stream, state.clone()));
+			}
+			Err(error) => eprintln!("accept: {error}"),
+		}
+	}
+}
+
+async fn connection<S>(stream: S, state: Arc<State>)
+where
+	S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+	let service = service_fn(move |request| {
+		let state = state.clone();
+		async move { Ok::<_, Infallible>(route(request, state).await) }
+	});
+	let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service).with_upgrades().await;
 }
 
 async fn route(request: Request<Incoming>, state: Arc<State>) -> Reply {
@@ -218,7 +232,7 @@ fn limit_refusal(which: &str) -> Reply {
 	refuse(StatusCode::INTERNAL_SERVER_ERROR, "This function could not be run.", Some(&format!("it reached its {which} limit")))
 }
 
-fn refuse(status: StatusCode, message: &str, hint: Option<&str>) -> Reply {
+pub fn refuse(status: StatusCode, message: &str, hint: Option<&str>) -> Reply {
 	let body = serde_json::json!({ "message": message, "hint": hint });
 	let mut reply = Response::new(full(body.to_string()));
 	*reply.status_mut() = status;
@@ -226,7 +240,7 @@ fn refuse(status: StatusCode, message: &str, hint: Option<&str>) -> Reply {
 	reply
 }
 
-fn text(status: StatusCode, body: &'static str) -> Reply {
+pub fn text(status: StatusCode, body: &'static str) -> Reply {
 	let mut reply = Response::new(full(body.to_owned()));
 	*reply.status_mut() = status;
 	reply.headers_mut().insert("content-type", hyper::header::HeaderValue::from_static("text/plain"));

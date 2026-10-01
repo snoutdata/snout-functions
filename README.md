@@ -1,14 +1,24 @@
 # snout-functions
 
 The runtime for Snout Functions: TypeScript and JavaScript on Deno's web platform, with Node
-compatibility for npm packages, answering HTTP. One process serves every project's functions on a
-host; each function runs in V8 isolates of its own, on threads of their own, with the memory, CPU
-and wall-clock limits its project's plan sets. Written in Rust on `deno_runtime` and `deno_core`
+compatibility for npm packages, answering HTTP. A front process answers the port for every
+project on a host and runs no customer code; each project's functions run in a process of that
+project's own, confined to what is that project's, and each function in V8 isolates of its own,
+on threads of their own, with the memory, CPU and wall-clock limits its project's plan sets. Written in Rust on `deno_runtime` and `deno_core`
 (MIT), built to run every project on a SnoutData Cloud host.
 
 > **Status: in production.** Every SnoutData Cloud project's functions, and the control plane's
 > own, run on it since 2026-09-30 (image 0.1.0: 94.6 MB, 39 MB compressed).
 
+- **A process per project, so two customers are never one bug apart.** The front process holds the
+  door's secret and every manifest, and runs no customer code. Each project's process is handed
+  only its own manifest, then shuts itself into a directory holding only its own bundles, as a user
+  of its own, with no capability and `no_new_privs`, before it runs any of the project's code. Code
+  that escaped its V8 isolate would be in a process that can read only its own project's secrets,
+  and can reach no other project's process, socket or file (`tests/isolation-probe.sh`, 22 checks
+  read from outside each process). The cost, on 2 cores with 20 projects warm: 10.3 MB a project
+  against 8.0 in one process, a project's first request 7.4 ms against 3.1 (a spare process waits
+  booted), a warm request 1.3 ms against 1.0 (`tests/project-cost-probe.sh`).
 - **Isolated by permissions, not by trust.** A worker may read its own bundle and read and write
   its own socket directory, and reach the network; nothing else. No environment of the process, no
   subprocess, no FFI, no other file, and never this container's own loopback, where the runtime's
@@ -64,7 +74,10 @@ snout-functions start [--port 9000] [--root /snoutfn] [--sockets <dir>] [--main-
 | `SNOUT_FUNCTIONS_MAX_WORKERS` | `256` | no | Workers on the host at once; past it, `503` with `Retry-After: 1` |
 | `SNOUT_FUNCTIONS_MEMORY_MB` | the container's cap | no | The memory every worker together may use, counted against this process. Unset, the container's own cgroup cap is read; past 85% of it a new worker first stops an idle one, and with none idle the request waits on its function's busy worker or gets `503` |
 | `SNOUT_FUNCTIONS_MAX_REPLICAS` | the cores | no | The most workers one function gets when each is busy on CPU (a function's own concurrency may lower it) |
-| `SNOUT_FUNCTIONS_SPARES` | `1` | no | Isolates kept booted per memory limit in use; `0` boots one per cold request |
+| `SNOUT_FUNCTIONS_SPARES` | `1` | no | Isolates kept booted per memory limit in use; `0` boots one per cold request. Unset, a project's process keeps one only while the project has more than one function |
+| `SNOUT_FUNCTIONS_SPARE_PROCESSES` | `1` | no | Processes kept booted and unassigned, each with an isolate, for the next project's first request |
+| `SNOUT_FUNCTIONS_MAX_PROJECTS` | `64` | no | Projects' processes running at once; past it, the one idle longest is stopped, or `503` |
+| `SNOUT_FUNCTIONS_PROCESSES` | a process per project | no | `one` runs every project in the front process, the layout before 0.2.0, kept for the probes that measure one process |
 | `SNOUT_FUNCTIONS_REHEARSE` | on | no | `0` stops spares serving a request to themselves before they are claimed |
 | `SNOUT_FUNCTIONS_DRAIN_MS` | `25000` | no | How long SIGTERM waits for requests in flight |
 | `SNOUT_FUNCTIONS_V8_FLAGS` | none | no | Space-separated V8 flags, after the runtime's own (`--minor-ms --optimize-for-size`), which they override |

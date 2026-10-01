@@ -35,7 +35,7 @@ deno_error = "=0.7.1"
 deno_ast = { version = "=0.53.3", features = ["transpiling"] }
 
 # The port the front door calls, and the proxy to each worker's own server.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "signal", "time", "sync", "process", "io-util", "io-std"] }
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body = "1"
@@ -46,6 +46,8 @@ flate2 = "1"
 brotli = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The system calls that shut a project's process into its own directory and user (src/confine.rs).
+libc = "0.2"
 
 [build-dependencies]
 # deno_snapshots builds its snapshot in a build script, and under resolver 3 a build script's

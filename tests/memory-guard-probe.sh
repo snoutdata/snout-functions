@@ -29,7 +29,8 @@ trap 'kill $server 2>/dev/null; wait $server 2>/dev/null; rm -rf "$root"' EXIT
 for _ in $(seq 1 200); do curl -sf "http://127.0.0.1:$port/_snoutpod/health" >/dev/null && break; sleep 0.05; done
 
 call() { curl -s -m 30 -H "x-snoutdata-ref: $ref" "http://127.0.0.1:$port/$1"; }
-anon() { awk '/^RssAnon/ { print int($2 / 1024) }' "/proc/$server/status"; }
+# The server and every process it started (a process per project since 0.2.0).
+anon() { for p in $server $(pgrep -P "$server"); do cat "/proc/$p/status" 2>/dev/null; done | awk '/^RssAnon/ { kb += $2 } END { print int(kb / 1024) }'; }
 call calm > /dev/null
 peak=0; last=""; stopped=""
 for i in $(seq 1 40); do
