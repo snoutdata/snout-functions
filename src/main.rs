@@ -1,10 +1,14 @@
 //! snout-functions: the Snout Functions runtime.
 //!
-//! One process per host serves every project's functions. It accepts the command line hosts
-//! already pass (`start --main-service /snoutfn/main --port 9000`); the main service is ignored,
-//! because routing a request to its function is this binary's own work.
+//! `start` is the front process: it answers the port, holds the door's secret and the manifests,
+//! and runs each project's functions in a process of that project's own, confined to what is that
+//! project's (router.rs, project.rs, confine.rs). `SNOUT_FUNCTIONS_PROCESSES=one` keeps the layout
+//! before 0.2.0, every project in this one process, for the probes that measure one process. It
+//! accepts the command line hosts already pass (`start --main-service /snoutfn/main --port 9000`);
+//! the main service is ignored, because routing a request to its function is this binary's own work.
 //!
 //!   snout-functions start [--main-service <ignored>] [--port 9000] [--root /snoutfn]
+//!   snout-functions project        (started by `start`, never by hand)
 //!   snout-functions boot-bench [n]
 
 /// A line on stderr when SNOUT_FUNCTIONS_DEBUG is set: worker starts and stops, limit decisions.
@@ -18,11 +22,14 @@ macro_rules! debug {
 
 mod compress;
 mod compressible;
+mod confine;
 mod http;
 mod isolate;
 mod loader;
 mod manifest;
 mod node;
+mod project;
+mod router;
 mod supervisor;
 mod v8_memory;
 
@@ -48,6 +55,10 @@ fn main() {
 	}
 	match args.get(1).map(String::as_str) {
 		Some("start") => start(&args[2..]),
+		Some("project") => {
+			let (idle, max_workers, max_replicas) = sizes();
+			project::run(idle, max_workers, max_replicas);
+		}
 		Some("boot-bench") => boot_bench(args.get(2).and_then(|v| v.parse().ok()).unwrap_or(30)),
 		_ => {
 			eprintln!("usage: snout-functions start [--port 9000] [--root /snoutfn]");
@@ -76,12 +87,11 @@ fn start(args: &[String]) {
 		}
 		i += 2;
 	}
-	let idle = Duration::from_millis(env_number("SNOUT_FUNCTIONS_IDLE_MS", 60_000));
-	let max_workers = usize::try_from(env_number("SNOUT_FUNCTIONS_MAX_WORKERS", 256)).unwrap_or(256);
-	// How many workers one function may have when each is busy on CPU: one a core, since more
-	// could only take turns.
-	let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-	let max_replicas = usize::try_from(env_number("SNOUT_FUNCTIONS_MAX_REPLICAS", u64::try_from(cores).unwrap_or(1))).unwrap_or(1);
+	let (idle, max_workers, max_replicas) = sizes();
+	if std::env::var("SNOUT_FUNCTIONS_PROCESSES").map_or(true, |v| v != "one") {
+		start_front(port, root, idle);
+		return;
+	}
 	let _ = std::fs::remove_dir_all(&sockets);
 	if let Err(error) = std::fs::create_dir_all(&sockets) {
 		eprintln!("{}: {error}", sockets.display());
@@ -102,7 +112,7 @@ fn start(args: &[String]) {
 				std::process::exit(1);
 			}
 		};
-		let supervisor = supervisor::Supervisor::new(sockets, idle, max_workers, max_replicas);
+		let supervisor = supervisor::Supervisor::new(sockets, idle, max_workers, max_replicas, true);
 		tokio::spawn(supervisor.clone().watch());
 		// One isolate booted ahead for the default limit, so the first cold request after a start
 		// does not pay the boot either.
@@ -133,6 +143,71 @@ fn start(args: &[String]) {
 		while supervisor.in_flight() > 0 && std::time::Instant::now() < deadline {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
+		std::process::exit(0);
+	});
+}
+
+/// How long a worker is kept idle, how many one process may run, and how many one function may.
+fn sizes() -> (Duration, usize, usize) {
+	let idle = Duration::from_millis(env_number("SNOUT_FUNCTIONS_IDLE_MS", 60_000));
+	let max_workers = usize::try_from(env_number("SNOUT_FUNCTIONS_MAX_WORKERS", 256)).unwrap_or(256);
+	// How many workers one function may have when each is busy on CPU: one a core, since more
+	// could only take turns.
+	let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+	let max_replicas = usize::try_from(env_number("SNOUT_FUNCTIONS_MAX_REPLICAS", u64::try_from(cores).unwrap_or(1))).unwrap_or(1);
+	(idle, max_workers, max_replicas)
+}
+
+/// The front process (router.rs): no isolate of its own, a process per project.
+fn start_front(port: u16, root: PathBuf, idle: Duration) {
+	let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+		Ok(runtime) => runtime,
+		Err(error) => {
+			eprintln!("{error}");
+			std::process::exit(1);
+		}
+	};
+	runtime.block_on(async move {
+		let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+			Ok(listener) => listener,
+			Err(error) => {
+				eprintln!("port {port}: {error}");
+				std::process::exit(1);
+			}
+		};
+		let door = std::env::var(http::DOOR_ENV).ok().filter(|v| !v.is_empty()).map(String::into_bytes);
+		if door.is_none() {
+			eprintln!("WARNING: {} is not set, so a request is not asked to prove it came through the front door", http::DOOR_ENV);
+		}
+		let max_projects = usize::try_from(env_number("SNOUT_FUNCTIONS_MAX_PROJECTS", 64)).unwrap_or(64);
+		let router = match router::Router::new(root, door, idle, max_projects) {
+			Ok(router) => router,
+			Err(error) => {
+				eprintln!("{error}");
+				std::process::exit(1);
+			}
+		};
+		router.keep_spares();
+		tokio::spawn(router.clone().watch());
+		eprintln!("snout-functions listening on {port}, a process per project");
+		let mut terminate = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+			Ok(signal) => signal,
+			Err(error) => {
+				eprintln!("SIGTERM: {error}");
+				std::process::exit(1);
+			}
+		};
+		tokio::select! {
+			() = router::serve(listener, router.clone()) => {}
+			_ = terminate.recv() => {}
+		}
+		let drain = Duration::from_millis(env_number("SNOUT_FUNCTIONS_DRAIN_MS", 25_000));
+		eprintln!("SIGTERM: draining {} request(s) in flight", router.in_flight());
+		let deadline = std::time::Instant::now() + drain;
+		while router.in_flight() > 0 && std::time::Instant::now() < deadline {
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		// Leaving closes every project's stdin, which ends their processes too.
 		std::process::exit(0);
 	});
 }

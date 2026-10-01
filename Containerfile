@@ -7,9 +7,10 @@
 # wants clang, cmake and protoc for the Deno crates' build scripts.
 #
 # Root inside the container, on purpose: the host agent writes each project's manifest 0600 as
-# the user rootless podman maps to the container's root, and the runtime must read them. On a
-# host that is the unprivileged `snoutpod` user; what confines a customer's code is the isolate's
-# permissions (src/isolate.rs), not this uid.
+# the user rootless podman maps to the container's root, and the front process must read them;
+# and it is root that may shut each project's process into its own directory as a user of its own
+# (src/confine.rs: chroot, setuid, setgid, which a container's default capabilities allow). On a
+# host that root is the unprivileged `snoutpod` user. Customer code never runs as it.
 FROM docker.io/library/rust:1.98.1-bookworm AS build
 RUN apt-get update -q \
 	&& apt-get install -y -q --no-install-recommends clang libclang-dev cmake protobuf-compiler pkg-config \

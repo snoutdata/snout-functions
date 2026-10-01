@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -187,7 +187,7 @@ type Claim = (Spec, Ready);
 /// `trim_spares` lets the extras go once claims stop for `BURST_MS` ten times over.
 struct Spares {
 	by_limit: Mutex<HashMap<u32, Pool>>,
-	per_limit: usize,
+	per_limit: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -205,7 +205,7 @@ fn spares() -> &'static Spares {
 	static SPARES: OnceLock<Spares> = OnceLock::new();
 	SPARES.get_or_init(|| Spares {
 		by_limit: Mutex::new(HashMap::new()),
-		per_limit: std::env::var("SNOUT_FUNCTIONS_SPARES").ok().and_then(|v| v.parse().ok()).unwrap_or(1),
+		per_limit: AtomicUsize::new(std::env::var("SNOUT_FUNCTIONS_SPARES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)),
 	})
 }
 
@@ -214,7 +214,7 @@ pub fn keep_spare(memory_mb: u32) {
 	let pool = spares();
 	let Ok(mut held) = pool.by_limit.lock() else { return };
 	let spares = held.entry(memory_mb).or_default();
-	spares.target = spares.target.max(pool.per_limit);
+	spares.target = spares.target.max(pool.per_limit.load(Ordering::Relaxed));
 	spares.waiting.retain(|claim| !claim.is_closed());
 	while spares.waiting.len() < spares.target {
 		spares.waiting.push(start_thread(memory_mb, true));
@@ -226,12 +226,25 @@ pub fn trim_spares() {
 	let pool = spares();
 	let Ok(mut held) = pool.by_limit.lock() else { return };
 	let now = now_ms();
+	let per_limit = pool.per_limit.load(Ordering::Relaxed);
 	for spares in held.values_mut() {
-		if spares.target > pool.per_limit && now.saturating_sub(spares.last_claim_ms) > BURST_MS * 10 {
-			spares.target = pool.per_limit;
+		if spares.target > per_limit && now.saturating_sub(spares.last_claim_ms) > BURST_MS * 10 {
+			spares.target = per_limit;
 			spares.waiting.retain(|claim| !claim.is_closed());
-			spares.waiting.truncate(pool.per_limit);
+			spares.waiting.truncate(per_limit);
 		}
+	}
+}
+
+/// How many spares each limit is refilled to from now on. One already booted stays until it is
+/// claimed: a project's own process (project.rs) keeps refilling only while the project has a
+/// second function to start, and its first request still takes the isolate it booted unassigned.
+pub fn set_spares(count: usize) {
+	let pool = spares();
+	pool.per_limit.store(count, Ordering::Relaxed);
+	let Ok(mut held) = pool.by_limit.lock() else { return };
+	for spares in held.values_mut() {
+		spares.target = count;
 	}
 }
 
@@ -242,8 +255,9 @@ pub fn spawn(spec: Spec) -> oneshot::Receiver<Result<Arc<Worker>, String>> {
 	let spare = pool.by_limit.lock().ok().and_then(|mut held| {
 		let spares = held.get_mut(&memory_mb)?;
 		let now = now_ms();
-		if pool.per_limit > 0 && now.saturating_sub(spares.last_claim_ms) < BURST_MS {
-			spares.target = (spares.target + 1).min(BURST_MAX.max(pool.per_limit));
+		let per_limit = pool.per_limit.load(Ordering::Relaxed);
+		if per_limit > 0 && now.saturating_sub(spares.last_claim_ms) < BURST_MS {
+			spares.target = (spares.target + 1).min(BURST_MAX.max(per_limit));
 		}
 		spares.last_claim_ms = now;
 		spares.waiting.retain(|claim| !claim.is_closed());

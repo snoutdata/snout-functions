@@ -22,12 +22,17 @@
 //! 2026-09-29 bench. Per request since arrival would charge a long stream everyone else's CPU.)
 //!
 //! Room for a worker is counted twice: by number (`max_workers`) and by MEMORY. Every project on
-//! the host is in this one process, in one container with one memory cap (1 GB on the fleet), and
-//! the kernel's answer to a container over its cap is to kill the process, every project at once.
-//! So past `MEMORY_ROOM` of the cap a new worker starts only by stopping an idle one; with none
-//! idle, a request waits on a worker its function already has, or hears 503 and `Retry-After`.
-//! And past `MEMORY_GUARD`, when workers already running have grown, the one holding the most is
-//! stopped: its requests hear why, and the line it logs ("memory guard") is the one to watch for.
+//! the host is in one container with one memory cap (1 GB on the fleet), and the kernel's answer to
+//! a container over its cap is to kill what is in it, every project at once. So past
+//! `MEMORY_ROOM` of the cap a new worker starts only by stopping an idle one; with none idle, a
+//! request waits on a worker its function already has, or hears 503 and `Retry-After`. And past
+//! `MEMORY_GUARD`, when workers already running have grown, the one holding the most is stopped:
+//! its requests hear why, and the line it logs ("memory guard") is the one to watch for.
+//!
+//! Each project runs in a process of its own (router.rs), and only the front process sees the
+//! whole container, so a project's supervisor is built not to weigh (`weigh: false`): the front
+//! process counts, and asks the process holding the most to stop its largest worker
+//! (`stop_largest`). A supervisor that weighs is the single-process layout (`start --shared`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::collections::hash_map::DefaultHasher;
@@ -49,7 +54,7 @@ const STALL_MS: u64 = 30;
 /// The share of the container's memory past which a new worker must make room first, in percent.
 /// A worker costs ~7 MB before its function allocates (tests/memory-probe.sh), so this leaves a
 /// cap of 1 GB about 150 MB for the functions already running to grow into.
-const MEMORY_ROOM: u64 = 85;
+pub const MEMORY_ROOM: u64 = 85;
 
 /// The share of the container's memory past which the worker holding the most is stopped, so one
 /// function pays for the host running short rather than the kernel killing every project. 90, not
@@ -58,8 +63,8 @@ const MEMORY_ROOM: u64 = 85;
 /// one a `GUARD_EVERY_MS`, which gives a stopped worker's memory time to come back, and only a
 /// worker holding at least `GUARD_SHARE` of the cap: past it the memory is elsewhere, and
 /// stopping a small worker would free nothing.
-const MEMORY_GUARD: u64 = 90;
-const GUARD_EVERY_MS: u64 = 1_000;
+pub const MEMORY_GUARD: u64 = 90;
+pub const GUARD_EVERY_MS: u64 = 1_000;
 const GUARD_SHARE: u64 = 20;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -105,8 +110,12 @@ pub struct Supervisor {
 	/// The memory cap in bytes, and whether it is the cgroup's (else `SNOUT_FUNCTIONS_MEMORY_MB`,
 	/// counted against this process alone); None where there is none.
 	memory_cap: Option<(u64, bool)>,
-	/// Anonymous memory in use, sampled by `watch` every 100 ms.
+	/// Anonymous memory in use, sampled by `watch` every 100 ms, or as the front process last
+	/// told it (`set_memory`).
 	memory_used: AtomicU64,
+	/// The container's cap as the front process told it, for a project's process, which can see
+	/// neither the cgroup nor the others; 0 until it has. Used only to make room, never to guard.
+	told_cap: AtomicU64,
 }
 
 /// A request's claim on a worker: counted in flight while it lives.
@@ -130,11 +139,12 @@ pub enum Refusal {
 }
 
 impl Supervisor {
-	pub fn new(sockets: PathBuf, idle: Duration, max_workers: usize, max_replicas: usize) -> Arc<Self> {
-		let memory_cap = memory_cap();
+	pub fn new(sockets: PathBuf, idle: Duration, max_workers: usize, max_replicas: usize, weigh: bool) -> Arc<Self> {
+		let memory_cap = if weigh { memory_cap() } else { None };
 		match memory_cap {
 			Some((cap, cgroup)) => eprintln!("memory cap {} MB ({}): new workers make room past {MEMORY_ROOM}%", cap >> 20, if cgroup { "the container's" } else { "SNOUT_FUNCTIONS_MEMORY_MB, this process" }),
-			None => eprintln!("no memory cap found: workers are counted, not weighed"),
+			None if weigh => eprintln!("no memory cap found: workers are counted, not weighed"),
+			None => {}
 		}
 		Arc::new(Supervisor {
 			sockets,
@@ -146,12 +156,20 @@ impl Supervisor {
 			max_replicas: max_replicas.max(1),
 			memory_cap,
 			memory_used: AtomicU64::new(0),
+			told_cap: AtomicU64::new(0),
 		})
+	}
+
+	/// The container's memory as the front process read it: a project's process makes room by it.
+	pub fn set_memory(&self, used: u64, cap: u64) {
+		self.memory_used.store(used, Ordering::Release);
+		self.told_cap.store(cap, Ordering::Release);
 	}
 
 	/// Whether one more worker fits under the memory cap without stopping another.
 	fn memory_allows_another(&self) -> bool {
-		self.memory_cap.is_none_or(|(cap, _)| self.memory_used.load(Ordering::Acquire) < cap / 100 * MEMORY_ROOM)
+		let cap = self.memory_cap.map_or_else(|| self.told_cap.load(Ordering::Acquire), |(cap, _)| cap);
+		cap == 0 || self.memory_used.load(Ordering::Acquire) < cap / 100 * MEMORY_ROOM
 	}
 
 	fn now_ms(&self) -> u64 {
@@ -326,33 +344,44 @@ impl Supervisor {
 				});
 			}
 			slots.retain(|_, held| !held.is_empty());
-			if let Some((used, cap)) = over {
-				let largest = slots
-					.values()
-					.flatten()
-					.filter_map(|slot| slot.get()?.as_ref().ok().cloned())
-					.filter(|entry| entry.worker.alive())
-					.max_by_key(|entry| entry.worker.memory_bytes())
-					.filter(|entry| entry.worker.memory_bytes() >= cap / GUARD_SHARE);
-				if let Some(entry) = largest {
-					eprintln!(
-						"{}: stopped by the memory guard, holding {} MB, with the container at {}% of its {} MB",
-						entry.worker.label,
-						entry.worker.memory_bytes() >> 20,
-						used * 100 / cap.max(1),
-						cap >> 20
-					);
-					entry.worker.stop("the host ran short of memory");
-					guarded_ms = now;
-				}
+			if let Some((used, cap)) = over
+				&& stop_largest_in(&slots, used, cap)
+			{
+				guarded_ms = now;
 			}
 		}
 	}
+
+	/// The memory guard, asked for by the front process, which sees the container: stop this
+	/// process's largest worker if it holds a share worth stopping. Whether one was stopped.
+	pub fn stop_largest(&self, used: u64, cap: u64) -> bool {
+		self.slots.lock().is_ok_and(|slots| stop_largest_in(&slots, used, cap))
+	}
+}
+
+fn stop_largest_in(slots: &HashMap<Key, Vec<Slot>>, used: u64, cap: u64) -> bool {
+	let largest = slots
+		.values()
+		.flatten()
+		.filter_map(|slot| slot.get()?.as_ref().ok().cloned())
+		.filter(|entry| entry.worker.alive())
+		.max_by_key(|entry| entry.worker.memory_bytes())
+		.filter(|entry| entry.worker.memory_bytes() >= cap / GUARD_SHARE);
+	let Some(entry) = largest else { return false };
+	eprintln!(
+		"{}: stopped by the memory guard, holding {} MB, with the container at {}% of its {} MB",
+		entry.worker.label,
+		entry.worker.memory_bytes() >> 20,
+		used * 100 / cap.max(1),
+		cap >> 20
+	);
+	entry.worker.stop("the host ran short of memory");
+	true
 }
 
 /// The container's memory cap: `SNOUT_FUNCTIONS_MEMORY_MB` if set, else its cgroup's
 /// `memory.max` (the container's own, under a private cgroup namespace), else none.
-fn memory_cap() -> Option<(u64, bool)> {
+pub fn memory_cap() -> Option<(u64, bool)> {
 	if let Some(mb) = std::env::var("SNOUT_FUNCTIONS_MEMORY_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
 		return Some((mb << 20, false));
 	}
@@ -361,7 +390,7 @@ fn memory_cap() -> Option<(u64, bool)> {
 
 /// Anonymous memory in use: the cgroup's `anon` when the cap is the cgroup's (what the cap is
 /// reached by; file pages are reclaimed first), else this process's own.
-fn memory_used(cgroup: bool) -> u64 {
+pub fn memory_used(cgroup: bool) -> u64 {
 	let counted = cgroup
 		.then(|| std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok())
 		.flatten()

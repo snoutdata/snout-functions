@@ -6966,6 +6966,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "node_resolver",
  "serde",
  "serde_json",
