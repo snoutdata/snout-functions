@@ -73,6 +73,9 @@ pub struct Project {
 	orders: tokio::sync::Mutex<Option<ChildStdin>>,
 	/// The manifest file's time when it was last sent, and the bundles in its directory.
 	sent: Mutex<(Option<SystemTime>, HashSet<String>)>,
+	/// Held while its directory is written, so a changed manifest and the refresh in `watch`
+	/// never copy the same bundle at once.
+	preparing: tokio::sync::Mutex<()>,
 	inflight: AtomicUsize,
 	last_used_ms: AtomicU64,
 	alive: Arc<AtomicBool>,
@@ -266,6 +269,7 @@ impl Router {
 			pid: spare.pid,
 			orders: tokio::sync::Mutex::new(Some(spare.stdin)),
 			sent: Mutex::new((stamp, digests.into_iter().collect())),
+			preparing: tokio::sync::Mutex::new(()),
 			inflight: AtomicUsize::new(0),
 			last_used_ms: AtomicU64::new(self.now_ms()),
 			alive: spare.alive,
@@ -279,6 +283,7 @@ impl Router {
 			digests(manifest).into_iter().filter(|digest| !sent.1.contains(digest)).collect()
 		};
 		if !missing.is_empty() {
+			let _preparing = project.preparing.lock().await;
 			let (bundles, view, confine, uid, todo) = (self.bundles.clone(), self.views.join(&project.name), self.confine, self.uid_for(&project.name), missing.clone());
 			tokio::task::spawn_blocking(move || prepare(&view, &bundles, &todo, confine.then_some(uid))).await.map_err(|error| error.to_string())??;
 		}
@@ -381,9 +386,39 @@ impl Router {
 				}
 				self.keep_spares();
 			}
+			if ticks.is_multiple_of(REFRESH_TICKS) {
+				self.refresh().await;
+			}
+		}
+	}
+
+	/// Each running project's copies, against what the host has built since they were taken.
+	///
+	/// A manifest that has not changed is never sent again, so without this a bundle the host
+	/// rebuilds (after a failed build, or under a new builder) would be served from the copy taken
+	/// before, for as long as the project's process lived. The check is a few stats per bundle.
+	async fn refresh(&self) {
+		for project in self.live() {
+			let Ok(_preparing) = project.preparing.try_lock() else {
+				continue;
+			};
+			let digests: Vec<String> = project.sent.lock().map(|sent| sent.1.iter().cloned().collect()).unwrap_or_default();
+			let (bundles, view, confine, uid) = (self.bundles.clone(), self.views.join(&project.name), self.confine, self.uid_for(&project.name));
+			match tokio::task::spawn_blocking(move || prepare(&view, &bundles, &digests, confine.then_some(uid))).await {
+				Ok(Ok(replaced)) => {
+					for digest in replaced {
+						eprintln!("{}: bundle {digest} was built again on the host, so its copy was replaced", project.name);
+					}
+				}
+				Ok(Err(error)) => eprintln!("{}: its bundles could not be refreshed: {error}", project.name),
+				Err(error) => eprintln!("{}: its bundles could not be refreshed: {error}", project.name),
+			}
 		}
 	}
 }
+
+/// How often `refresh` runs, in `watch`'s 100 ms ticks.
+const REFRESH_TICKS: u64 = 50;
 
 fn now_ms() -> u64 {
 	u64::try_from(crate::uptime_ms()).unwrap_or(u64::MAX)
@@ -400,8 +435,16 @@ fn digests(manifest: &Manifest) -> Vec<String> {
 /// A project's directory: its bundles (copied from the mount, which it cannot see), a /tmp and
 /// its socket's directory, and the two files the resolver reads. Owned by the project's uid where
 /// it is confined, so it can read what it runs and nothing it does not.
-fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) -> Result<(), String> {
+///
+/// A copy is replaced when the host has prepared its bundle again since (`build_state`), and
+/// the digests replaced are returned. A bundle is named by its source, not by its build, so a
+/// copy taken before the host had built it stayed unbuilt for as long as this process ran: on
+/// 2026-10-02 a function copied in the moment before its build landed was refused ("has not been
+/// prepared yet") through three control-plane deploys, each of which rebuilt it correctly, until
+/// the container was restarted.
+fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) -> Result<Vec<String>, String> {
 	let fail = |what: &Path, error: std::io::Error| format!("{}: {error}", what.display());
+	let fresh = !view.join("bundles").exists();
 	for dir in ["bundles", "etc", "tmp", "sockets"] {
 		let path = view.join(dir);
 		std::fs::create_dir_all(&path).map_err(|e| fail(&path, e))?;
@@ -424,24 +467,51 @@ fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) ->
 		let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/snout-functions"));
 		std::os::unix::fs::symlink(binary, &exe).map_err(|e| fail(&exe, e))?;
 	}
+	let mut copied = false;
+	let mut replaced = Vec::new();
 	for digest in digests {
 		let to = view.join("bundles").join(digest);
-		if to.exists() {
-			continue;
-		}
 		let from = bundles.join(digest);
 		if !from.is_dir() {
+			continue;
+		}
+		let stale = to.exists();
+		if stale && build_state(&to) == build_state(&from) {
 			continue;
 		}
 		let partial = view.join("bundles").join(format!(".{digest}.partial"));
 		let _ = std::fs::remove_dir_all(&partial);
 		copy_dir(&from, &partial).map_err(|e| fail(&from, e))?;
+		// Swapped whole, so a worker starting now reads the old copy or the new one.
+		let old = view.join("bundles").join(format!(".{digest}.old"));
+		if stale {
+			let _ = std::fs::remove_dir_all(&old);
+			std::fs::rename(&to, &old).map_err(|e| fail(&to, e))?;
+		}
 		std::fs::rename(&partial, &to).map_err(|e| fail(&to, e))?;
+		if stale {
+			let _ = std::fs::remove_dir_all(&old);
+			replaced.push(digest.clone());
+		}
+		copied = true;
 	}
-	if let Some(uid) = uid {
+	if let Some(uid) = uid
+		&& (fresh || copied)
+	{
 		own(view, uid).map_err(|e| fail(view, e))?;
 	}
-	Ok(())
+	Ok(replaced)
+}
+
+/// What the host has made of a bundle's source (functionRuntime.ts writes `.built`): the builder
+/// that made it, the build's size, and the builder's error if it failed. Equal on a faithful copy,
+/// and different once the host builds it again, which it does after a failure and when the
+/// builder's pin moves.
+fn build_state(bundle: &Path) -> (String, Option<u64>, String) {
+	let built = bundle.join(".built");
+	let read = |name: &str| std::fs::read_to_string(built.join(name)).map(|text| text.trim().to_owned()).unwrap_or_default();
+	let size = std::fs::metadata(built.join("main.js")).ok().map(|meta| meta.len());
+	(read("builder"), size, read("error.txt"))
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -627,5 +697,80 @@ impl Body for Passing {
 			Poll::Ready(Some(frame)) => Poll::Ready(Some(frame.map_err(Into::into))),
 			Poll::Pending => Poll::Pending,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::prepare;
+	use std::path::{Path, PathBuf};
+
+	fn scratch(name: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!("snout-router-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(dir.join("bundles").join("d1")).unwrap();
+		std::fs::write(dir.join("bundles").join("d1").join("index.ts"), "import './src/f/index.ts';\n").unwrap();
+		dir
+	}
+
+	fn build(bundle: &Path, builder: &str, main: Option<&str>, error: Option<&str>) {
+		let built = bundle.join(".built");
+		let _ = std::fs::remove_dir_all(&built);
+		std::fs::create_dir_all(&built).unwrap();
+		std::fs::write(built.join("builder"), format!("{builder}\n")).unwrap();
+		if let Some(main) = main {
+			std::fs::write(built.join("main.js"), main).unwrap();
+		}
+		if let Some(error) = error {
+			std::fs::write(built.join("error.txt"), error).unwrap();
+		}
+	}
+
+	#[test]
+	fn a_copy_taken_before_the_build_is_replaced_once_it_lands() {
+		let root = scratch("before");
+		let (bundles, view) = (root.join("bundles"), root.join("view"));
+		let digests = vec!["d1".to_owned()];
+		assert!(prepare(&view, &bundles, &digests, None).unwrap().is_empty());
+		assert!(!view.join("bundles/d1/.built/main.js").exists());
+
+		build(&bundles.join("d1"), "deno:2.9.7", Some("export {};"), None);
+		assert_eq!(prepare(&view, &bundles, &digests, None).unwrap(), digests);
+		assert_eq!(std::fs::read_to_string(view.join("bundles/d1/.built/main.js")).unwrap(), "export {};");
+		assert!(!view.join("bundles/.d1.old").exists());
+
+		// Settled: nothing more to copy.
+		assert!(prepare(&view, &bundles, &digests, None).unwrap().is_empty());
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn a_failed_build_that_later_succeeds_is_replaced() {
+		let root = scratch("retry");
+		let (bundles, view) = (root.join("bundles"), root.join("view"));
+		let digests = vec!["d1".to_owned()];
+		build(&bundles.join("d1"), "deno:2.9.7", None, Some("registry unreachable"));
+		prepare(&view, &bundles, &digests, None).unwrap();
+		assert!(view.join("bundles/d1/.built/error.txt").exists());
+
+		build(&bundles.join("d1"), "deno:2.9.7", Some("export {};"), None);
+		assert_eq!(prepare(&view, &bundles, &digests, None).unwrap(), digests);
+		assert!(!view.join("bundles/d1/.built/error.txt").exists());
+		assert!(view.join("bundles/d1/.built/main.js").exists());
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn a_new_builder_pin_replaces_the_copy() {
+		let root = scratch("pin");
+		let (bundles, view) = (root.join("bundles"), root.join("view"));
+		let digests = vec!["d1".to_owned()];
+		build(&bundles.join("d1"), "deno:2.9.7", Some("export {};"), None);
+		prepare(&view, &bundles, &digests, None).unwrap();
+
+		build(&bundles.join("d1"), "deno:2.9.8", Some("export {};"), None);
+		assert_eq!(prepare(&view, &bundles, &digests, None).unwrap(), digests);
+		assert_eq!(std::fs::read_to_string(view.join("bundles/d1/.built/builder")).unwrap().trim(), "deno:2.9.8");
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }
