@@ -25,6 +25,7 @@ mod compressible;
 mod confine;
 mod http;
 mod isolate;
+mod jwt;
 mod loader;
 mod manifest;
 mod node;

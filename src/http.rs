@@ -128,6 +128,9 @@ async fn answer(request: Request<Incoming>, state: Arc<State>) -> Reply {
 		// The same answer for "this project has deployed nothing" and "not that one".
 		return refuse(StatusCode::NOT_FOUND, &format!("There is no function called {name} in this project."), Some(&format!("Deploy it with: snoutdata functions deploy {name}")));
 	};
+	if let Some(refused) = manifest.refusal(&deployed, request.headers().get(hyper::header::AUTHORIZATION).map(|v| v.as_bytes())) {
+		return refuse(StatusCode::UNAUTHORIZED, refused.message(), None);
+	}
 	let digest = deployed.digest.clone();
 	if !manifest::valid_digest(&digest) {
 		return refuse(StatusCode::INTERNAL_SERVER_ERROR, "This function could not be run.", Some("its deployment is not valid"));

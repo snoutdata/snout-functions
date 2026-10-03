@@ -26,6 +26,7 @@ d_cpu=$(printf 'cpu' | sha256sum | cut -c1-64)
 d_sleep=$(printf 'sleep' | sha256sum | cut -c1-64)
 d_work=$(printf 'work' | sha256sum | cut -c1-64)
 d_url=$(printf 'url' | sha256sum | cut -c1-64)
+d_burn=$(printf 'burn' | sha256sum | cut -c1-64)
 bundle "$d_hello" 'index.ts=Deno.serve(() => new Response("ok"));'
 bundle "$d_ts" 'index.ts=import { greet } from "./greet.ts";
 Deno.serve(async (req: Request): Promise<Response> => new Response(greet(Deno.env.get("WHO") ?? "nobody")));' \
@@ -35,6 +36,7 @@ for (let i = 0; i < 256 * 16; i++) keep.push(kind === "heap" ? Array.from({ leng
 return new Response("held " + keep.length); });'
 bundle "$d_cpu" 'index.ts=Deno.serve(() => { for (;;) {} });'
 bundle "$d_work" 'index.ts=Deno.serve(() => { let x = 0; for (let i = 0; i < 3000000; i++) x += Math.sqrt(i); return new Response(String(x > 0)); });'
+bundle "$d_burn" 'index.ts=Deno.serve(() => { const end = Date.now() + 1200; let x = 0; while (Date.now() < end) x += Math.sqrt(x + 1); return new Response(String(x > 0)); });'
 bundle "$d_sleep" 'index.ts=Deno.serve(async (req) => { const ms = Number(new URL(req.url).searchParams.get("ms") ?? 1000); await new Promise((r) => setTimeout(r, ms)); return new Response("slept " + ms); });'
 d_loop=$(printf 'loop' | sha256sum | cut -c1-64)
 bundle "$d_loop" 'index.ts=Deno.serve(async () => { const out = {}; for (const base of ["127.0.0.1", "localhost", "127.0.0.2", "[::ffff:127.0.0.1]", "localtest.me", "2130706433", "127.1"]) { const u = "http://" + base + ":19000/hello"; try { out[base] = (await fetch(u, { headers: { "x-snoutdata-ref": "smoketestref01" } })).status; } catch (e) { out[base] = e.name; } } return Response.json(out); });'
@@ -54,7 +56,7 @@ manifest() { # env json
 { "ref": "$ref", "functions": [
 	{ "name": "hello", "digest": "$d_hello" }, { "name": "ts", "digest": "$d_ts" },
 	{ "name": "mem", "digest": "$d_mem" }, { "name": "cpu", "digest": "$d_cpu" },
-	{ "name": "sleep", "digest": "$d_sleep" }, { "name": "work", "digest": "$d_work" }, { "name": "loop", "digest": "$d_loop" }, { "name": "url", "digest": "$d_url" }, { "name": "peer", "digest": "$d_peer" } ],
+	{ "name": "sleep", "digest": "$d_sleep" }, { "name": "work", "digest": "$d_work" }, { "name": "loop", "digest": "$d_loop" }, { "name": "url", "digest": "$d_url" }, { "name": "peer", "digest": "$d_peer" }, { "name": "burn", "digest": "$d_burn" } ],
   "limits": { "memoryMb": 128, "wallMs": 30000, "cpuMs": 2000, "hardCpuMs": 3500 }, "env": $1 }
 JSON
 	mv "$root/projects/$ref.json.tmp" "$root/projects/$ref.json"
@@ -98,6 +100,11 @@ check "steady CPU-bound traffic, 4 in flight, is never stopped" "240" "$(cat "$r
 one=$(date +%s%3N); for _ in $(seq 1 20); do call /work > /dev/null; done; one=$(( ($(date +%s%3N) - one) / 20 ))
 four=$(date +%s%3N); wpids=(); for w in 1 2 3 4; do ( for _ in $(seq 1 20); do call /work > /dev/null; done ) & wpids+=($!); done; wait "${wpids[@]}"; four=$(( ($(date +%s%3N) - four) / 20 ))
 echo "CPU-bound work: $one ms a request alone, $four ms a round of 4 in flight"
+# 16 requests of 1.2 s CPU each, all at once: each holds its worker for 1.2 s, under the hard
+# limit, but a worker runs several of them back to back in one turn of its event loop, which
+# read as one 4.8 s stall and stopped it for CPU (2026-10-02). The request counter is the fix.
+bpids=(); for i in $(seq 1 16); do call /burn > "$root/burn.$i" & bpids+=($!); done; wait "${bpids[@]}"
+check "16 requests of 1.2 s CPU each, in flight together, are never stopped" "16" "$(cat "$root"/burn.* | grep -o true | wc -l | tr -d " ")"
 check "4 CPU-bound requests in flight run side by side" "1" "$(( nproc_=$(nproc), nproc_ < 4 || four * 10 < one * 25 ))"
 out="$(call /loop)"; echo "a worker fetching the runtime on loopback: $out"
 # By name (127.0.0.1, localhost) the worker's permissions refuse it; every other address of this

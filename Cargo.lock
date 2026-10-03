@@ -6953,6 +6953,7 @@ dependencies = [
 name = "snout-functions"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "brotli 8.0.4",
  "bytes",
  "deno_ast",
@@ -6962,6 +6963,7 @@ dependencies = [
  "deno_runtime",
  "deno_snapshots",
  "flate2",
+ "hmac",
  "http-body",
  "http-body-util",
  "hyper",
@@ -6970,6 +6972,7 @@ dependencies = [
  "node_resolver",
  "serde",
  "serde_json",
+ "sha2",
  "sys_traits",
  "tokio",
  "url",
