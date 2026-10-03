@@ -22,6 +22,11 @@ pub struct Manifest {
 	pub limits: Limits,
 	#[serde(default)]
 	pub env: BTreeMap<String, String>,
+	/// The project's JWT signing secret, for `verify_jwt` (jwt.rs). Absent from a control plane
+	/// older than 0.2.2's, which leaves the front door's key check the only one, as before. Never
+	/// sent on to a project's own process.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub jwt_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -36,9 +41,28 @@ pub struct Deployed {
 	pub memory_mb: Option<u32>,
 	#[serde(default)]
 	pub concurrency: Option<usize>,
+	/// Whether a call needs a token signed with the project's secret (`verify_jwt`). True when
+	/// absent: the function is open only when it was deployed open.
+	#[serde(default = "yes")]
+	pub verify_jwt: bool,
+}
+
+fn yes() -> bool {
+	true
 }
 
 impl Manifest {
+	/// Why a call to `deployed` with this `Authorization` may not run, if it may not.
+	pub fn refusal(&self, deployed: &Deployed, authorization: Option<&[u8]>) -> Option<crate::jwt::Refused> {
+		let secret = self.jwt_secret.as_deref().filter(|_| deployed.verify_jwt)?;
+		crate::jwt::check(authorization, secret, crate::jwt::now()).err()
+	}
+
+	/// This manifest as a project's own process gets it: without the signing secret.
+	pub fn for_project(&self) -> Manifest {
+		Manifest { jwt_secret: None, ..self.clone() }
+	}
+
 	/// The limits a function runs under: the project's, with the function's own memory.
 	pub fn limits_for(&self, deployed: &Deployed) -> Limits {
 		let mut limits = self.limits;
@@ -198,6 +222,31 @@ mod tests {
 		assert_eq!(manifest.limits_for(b).memory_mb, 512);
 		assert_eq!(b.concurrency, None);
 		assert_eq!(manifest.limits_for(c).memory_mb, 1024);
+	}
+
+	#[test]
+	fn verify_jwt_is_checked_against_the_secret_and_the_secret_stays_in_the_front_process() {
+		let manifest: Manifest = serde_json::from_str(
+			r#"{ "functions": [
+				{ "name": "keyed", "digest": "x", "verifyJwt": true },
+				{ "name": "open", "digest": "y", "verifyJwt": false },
+				{ "name": "older", "digest": "z" } ],
+			  "jwtSecret": "s3cret" }"#,
+		)
+		.expect("a manifest");
+		let [keyed, open, older] = [&manifest.functions[0], &manifest.functions[1], &manifest.functions[2]];
+		let forged = b"Bearer eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.AAAA";
+		assert_eq!(manifest.refusal(keyed, Some(forged)), Some(crate::jwt::Refused::Invalid));
+		assert_eq!(manifest.refusal(keyed, None), Some(crate::jwt::Refused::Missing));
+		// A function deployed open is run for anyone, and one from before the flag needs a key.
+		assert_eq!(manifest.refusal(open, Some(forged)), None);
+		assert_eq!(manifest.refusal(older, Some(forged)), Some(crate::jwt::Refused::Invalid));
+		// A project's own process never receives the secret.
+		let sent = serde_json::to_string(&manifest.for_project()).expect("json");
+		assert!(!sent.contains("s3cret"));
+		// And a control plane that sends no secret leaves the door's key check the only one.
+		let older_plane: Manifest = serde_json::from_str(r#"{ "functions": [ { "name": "keyed", "digest": "x", "verifyJwt": true } ] }"#).expect("a manifest");
+		assert_eq!(older_plane.refusal(&older_plane.functions[0], Some(forged)), None);
 	}
 
 	#[test]

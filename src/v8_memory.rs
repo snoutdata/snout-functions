@@ -17,7 +17,7 @@
 
 use std::alloc::Layout;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use deno_core::v8;
@@ -145,4 +145,36 @@ pub fn allocator(limit: usize) -> (v8::UniqueRef<v8::Allocator>, Arc<Budget>) {
 	// `into_raw` took; the vtable is 'static.
 	let allocator = unsafe { v8::new_rust_allocator(handle, &VTABLE) };
 	(allocator, budget)
+}
+
+/// A counter JavaScript writes with `Atomics` and Rust reads from any thread: the first four
+/// bytes of a SharedArrayBuffer, with the backing store that keeps them alive. The worker's
+/// request counter (isolate.rs, `Worker::stalled_ms`).
+pub struct SharedCounter {
+	_store: v8::SharedRef<v8::BackingStore>,
+	count: *const AtomicI32,
+}
+
+// SAFETY: `count` points into the backing store `_store` keeps alive, allocated by `allocate`
+// above and so aligned to `ALIGN`, and is only ever read through an atomic, as the JavaScript
+// side writes it with Atomics. Dropping a SharedRef releases a reference count, which V8 makes
+// thread-safe.
+unsafe impl Send for SharedCounter {}
+// SAFETY: as above: every access is an atomic load.
+unsafe impl Sync for SharedCounter {}
+
+impl SharedCounter {
+	/// None for a buffer too short to hold a counter.
+	pub fn new(store: v8::SharedRef<v8::BackingStore>) -> Option<Self> {
+		if store.byte_length() < std::mem::size_of::<AtomicI32>() {
+			return None;
+		}
+		let count = store.data()?.as_ptr().cast::<AtomicI32>().cast_const();
+		Some(Self { _store: store, count })
+	}
+
+	pub fn load(&self) -> i32 {
+		// SAFETY: see the type.
+		unsafe { &*self.count }.load(Ordering::Acquire)
+	}
 }

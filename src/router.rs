@@ -287,7 +287,7 @@ impl Router {
 			let (bundles, view, confine, uid, todo) = (self.bundles.clone(), self.views.join(&project.name), self.confine, self.uid_for(&project.name), missing.clone());
 			tokio::task::spawn_blocking(move || prepare(&view, &bundles, &todo, confine.then_some(uid))).await.map_err(|error| error.to_string())??;
 		}
-		let line = format!("{}\n", serde_json::json!({ "manifest": manifest }));
+		let line = format!("{}\n", serde_json::json!({ "manifest": manifest.for_project() }));
 		let mut orders = project.orders.lock().await;
 		let stdin = orders.as_mut().ok_or("its process was stopped")?;
 		stdin.write_all(line.as_bytes()).await.map_err(|error| format!("its process did not take the change: {error}"))?;
@@ -598,13 +598,18 @@ async fn answer(request: Request<Incoming>, router: Arc<Router>) -> Reply {
 		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some("The path is /functions/v1/<name>"));
 	};
 	// Decided here, so no process is started for a function that does not exist.
-	let Some((manifest, wall_ms)) = router.manifests.get(&name).and_then(|m| {
+	let Some((manifest, wall_ms, refused)) = router.manifests.get(&name).and_then(|m| {
 		let deployed = m.functions.iter().find(|f| f.name == function)?;
 		let wall_ms = m.limits_for(deployed).wall_ms;
-		Some((m, wall_ms))
+		let refused = m.refusal(deployed, request.headers().get(hyper::header::AUTHORIZATION).map(|v| v.as_bytes()));
+		Some((m, wall_ms, refused))
 	}) else {
 		return refuse(StatusCode::NOT_FOUND, &format!("There is no function called {function} in this project."), Some(&format!("Deploy it with: snoutdata functions deploy {function}")));
 	};
+	// Decided here too, so a stranger's token never starts a process either.
+	if let Some(refused) = refused {
+		return refuse(StatusCode::UNAUTHORIZED, refused.message(), None);
+	}
 	// Past the project's own wall clock, which its process enforces and answers for, a margin.
 	let deadline = tokio::time::Instant::now() + Duration::from_millis(wall_ms) + Duration::from_secs(5);
 	let mut request = request;

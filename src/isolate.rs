@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -61,6 +61,19 @@ pub struct Worker {
 	/// turns; with the allocator's ArrayBuffers, what the worker holds (`memory_bytes`).
 	heap_bytes: Arc<AtomicU64>,
 	budget: Arc<crate::v8_memory::Budget>,
+	/// How many requests the worker's `Deno.serve` wrapper has started (INSTALL), the last count
+	/// `stalled_ms` saw, and when it saw it change. A request starting is the thread coming
+	/// back to the worker as surely as the event loop turning.
+	///
+	/// Why it exists: the heartbeat runs only when the event loop hands the thread back, and
+	/// when several requests are ready together one turn runs them back to back. Sixty requests
+	/// of one second's CPU each, to one function, stopped its worker for "CPU" twice (2026-10-02,
+	/// docs/cloud/QA-RETEST.md §3f): the limit read four healthy requests in a row as one that
+	/// had held the thread for four seconds. A request that holds it past the limit by itself
+	/// still moves no counter, and is still stopped.
+	requests: Option<crate::v8_memory::SharedCounter>,
+	requests_seen: AtomicI32,
+	request_ms: AtomicU64,
 }
 
 impl Worker {
@@ -92,13 +105,22 @@ impl Worker {
 	}
 
 	pub fn stalled_ms(&self) -> u64 {
-		now_ms().saturating_sub(self.beat_ms.load(Ordering::Acquire))
+		let now = now_ms();
+		if let Some(requests) = &self.requests {
+			let count = requests.load();
+			if self.requests_seen.swap(count, Ordering::AcqRel) != count {
+				self.request_ms.store(now, Ordering::Release);
+			}
+		}
+		now.saturating_sub(self.beat_ms.load(Ordering::Acquire).max(self.request_ms.load(Ordering::Acquire)))
 	}
 }
 
 /// Our own few lines, run before the customer's module. They close over what they need and
 /// leave nothing on `globalThis`.
 const INSTALL: &str = r#"((socketPath, vars) => {
+	// Bumped as each request starts; read by the supervisor (`Requests`).
+	const requests = new Int32Array(new SharedArrayBuffer(4));
 	const serve = Deno.serve;
 	Object.defineProperty(Deno, "serve", {
 		configurable: true,
@@ -120,6 +142,7 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 			// Served on a Unix socket, a request's URL would read `http+unix://`; the function
 			// sees the address it was called at instead, as it would on a TCP listener.
 			const called = (request, info) => {
+				Atomics.add(requests, 0, 1);
 				const at = new URL(request.url);
 				const url = "http://" + (request.headers.get("host") ?? "localhost") + at.pathname + at.search;
 				// Not `new Request(url, request)`: that copies the signal, and reading it asks Deno
@@ -168,6 +191,7 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 			return listen({ transport: "unix", path: socketPath });
 		},
 	});
+	return requests.buffer;
 })"#;
 
 type Ready = oneshot::Sender<Result<Arc<Worker>, String>>;
@@ -369,18 +393,6 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 	let stopping = Arc::new(tokio::sync::Notify::new());
 	let stopped_because = Arc::new(Mutex::new(None));
 	let heap_bytes = Arc::new(AtomicU64::new(0));
-	let handle = Arc::new(Worker {
-		label: spec.label.clone(),
-		socket: socket.clone(),
-		limits: spec.limits,
-		isolate: worker.js_runtime.v8_isolate().thread_safe_handle(),
-		beat_ms: beat_ms.clone(),
-		alive: alive.clone(),
-		stopped_because: stopped_because.clone(),
-		stopping: stopping.clone(),
-		heap_bytes: heap_bytes.clone(),
-		budget: budget.clone(),
-	});
 
 	{
 		// ArrayBuffer memory past the limit is refused where it is asked for (v8_memory.rs).
@@ -420,10 +432,37 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 		serde_json::to_string(&socket.to_string_lossy()).unwrap_or_default(),
 		serde_json::to_string(&spec.env).unwrap_or_else(|_| "{}".into())
 	);
-	if let Err(error) = worker.execute_script("[snout-functions]", ModuleCodeString::from(install)) {
-		let _ = ready.send(Err(format!("the worker could not be prepared: {error}")));
-		return;
-	}
+	let installed = match worker.execute_script("[snout-functions]", ModuleCodeString::from(install)) {
+		Ok(installed) => installed,
+		Err(error) => {
+			let _ = ready.send(Err(format!("the worker could not be prepared: {error}")));
+			return;
+		}
+	};
+	let requests = {
+		let runtime = &mut worker.js_runtime;
+		deno_core::scope!(scope, runtime);
+		let value = v8::Local::new(scope, &installed);
+		v8::Local::<v8::SharedArrayBuffer>::try_from(value)
+			.ok()
+			.and_then(|buffer| crate::v8_memory::SharedCounter::new(buffer.get_backing_store()))
+	};
+	let handle = Arc::new(Worker {
+		label: spec.label.clone(),
+		socket: socket.clone(),
+		limits: spec.limits,
+		isolate: worker.js_runtime.v8_isolate().thread_safe_handle(),
+		beat_ms: beat_ms.clone(),
+		alive: alive.clone(),
+		stopped_because: stopped_because.clone(),
+		stopping: stopping.clone(),
+		heap_bytes: heap_bytes.clone(),
+		budget: budget.clone(),
+		requests,
+		requests_seen: AtomicI32::new(0),
+		request_ms: AtomicU64::new(0),
+	});
+
 
 	let main = match ModuleSpecifier::from_file_path(entry(&spec.bundle)) {
 		Ok(main) => main,
