@@ -54,6 +54,8 @@ unmaintained = "workspace"
 yanked = "deny"
 # Known, with no upgrade we can make: each arrives through a dependency deno_runtime 0.267 pins.
 # Revisit on every deno_runtime bump; remove an entry the moment its fix is reachable.
+# cargo-audit carries these four too, plus four informational ones only it reports, in
+# .cargo/audit.toml with their reasons. An entry added here is added there.
 ignore = [
 	# rustls 0.23.40, pinned exactly by deno_tls: a TLS 1.3 client accepting handshake messages
 	# across encryption levels. Outbound fetch from customer code is the only TLS client here.
