@@ -1,0 +1,33 @@
+# cargo-audit's exceptions for this workspace, read by scripts/check.sh (which runs cargo audit
+# from this directory, since cargo-audit finds its config at ./.cargo/audit.toml).
+#
+# The first four are the advisories ../deny.toml ignores for cargo-deny; their reasons are there.
+# The other four only cargo-audit reports: they are informational (unmaintained, unsound) and on
+# crates below a dependency, which deny.toml's `workspace` scope leaves out and cargo-audit's
+# --deny warnings does not. Each arrives through deno_runtime 0.267.0, the newest published on
+# 2026-10-04, so there is no upgrade to take.
+#
+# Recorded 2026-10-04. Review by 2027-01-04, or on the next deno_runtime bump, whichever is first;
+# remove an entry the moment its fix is reachable (cargo audit then stops naming it).
+[advisories]
+ignore = [
+	# Shared with ../deny.toml.
+	"RUSTSEC-2026-0285", # rustls pinned =0.23.40 by deno_tls
+	"RUSTSEC-2026-0118", # hickory-proto: resolver not used
+	"RUSTSEC-2026-0119", # hickory-proto: resolver not used
+	"RUSTSEC-2023-0071", # rsa (Marvin): no fixed release
+	# rand 0.8.5, unsound: pinned =0.8.5 by deno_crypto 0.273 (fixed in 0.8.6, which cargo update
+	# cannot take). Unsound only when rand's `log` feature is on and a custom logger calls
+	# thread_rng while it reseeds. `log` is not enabled anywhere in this graph
+	# (cargo tree -e features -i rand@0.8.5), so the unsound path is not compiled.
+	"RUSTSEC-2026-0097",
+	# paste, unmaintained, no patched release, no known vulnerability: a proc-macro of v8, so it
+	# runs at build time only and is not in the binary.
+	"RUSTSEC-2024-0436",
+	# rustls-pemfile, unmaintained, no patched release, no known vulnerability: deno_tls 0.246
+	# requires ^2 to read PEM CA bundles. 2.2.0 is a thin wrapper over rustls-pki-types' parser.
+	"RUSTSEC-2025-0134",
+	# smartstring, unmaintained, no patched release, no known vulnerability: the swc lexer's string
+	# type, under deno_ast (which transpiles a function's TypeScript).
+	"RUSTSEC-2026-0249",
+]
