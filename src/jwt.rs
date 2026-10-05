@@ -1,7 +1,7 @@
 //! `verify_jwt`: a function that requires a key is run only for a request whose `Authorization`
 //! is a token signed with the project's own secret and not expired.
 //!
-//! The front door checks the `apikey` header against the key hashes it holds (D12: hashes only, so
+//! The front door checks the `apikey` header against the key hashes it holds (hashes only, so
 //! it cannot check a signature) and passes `Authorization` through. Until 0.2.2 nothing checked it,
 //! so a function marked "key required" ran for any caller holding the public anon key, whatever
 //! token it sent: a forged, unsigned `service_role` token reached the function, and a function

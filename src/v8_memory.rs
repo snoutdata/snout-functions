@@ -10,7 +10,7 @@
 //! stop, so the caller hears "memory limit".
 //!
 //! `unsafe` is denied everywhere else in the crate (Cargo.toml); this module is the V8
-//! embedding boundary, the way pgrx is the Postgres one for the extensions (X13). Every block
+//! embedding boundary, the way pgrx is the Postgres one for the extensions. Every block
 //! states what it relies on.
 
 #![allow(unsafe_code)]

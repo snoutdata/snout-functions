@@ -69,8 +69,8 @@ pub struct Worker {
 	///
 	/// Why it exists: the heartbeat runs only when the event loop hands the thread back, and
 	/// when several requests are ready together one turn runs them back to back. Sixty requests
-	/// of one second's CPU each, to one function, stopped its worker for "CPU" twice (2026-10-02,
-	/// docs/cloud/QA-RETEST.md §3f): the limit read four healthy requests in a row as one that
+	/// of one second's CPU each, to one function, stopped its worker for "CPU" twice (found in
+	/// testing, 2026-10-02): the limit read four healthy requests in a row as one that
 	/// had held the thread for four seconds. A request that holds it past the limit by itself
 	/// still moves no counter, and is still stopped.
 	requests: Option<crate::v8_memory::SharedCounter>,
@@ -240,7 +240,7 @@ type Claim = (Spec, Ready);
 /// been asked for, replaced as soon as it is taken; `SNOUT_FUNCTIONS_SPARES=0` turns it off.
 ///
 /// Cold requests in a burst outrun one spare: the next claim finds the replacement still booting
-/// and waits for the rest of it (a cold p50 of 29 ms against a 10 ms target, bench 2026-09-29). So
+/// and waits for the rest of it (a cold p50 of 29 ms against a 10 ms target, measured 2026-09-29). So
 /// a claim within `BURST_MS` of the previous one asks for one spare more, up to `BURST_MAX`, and
 /// `trim_spares` lets the extras go once claims stop for `BURST_MS` ten times over.
 struct Spares {

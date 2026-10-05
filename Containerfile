@@ -42,8 +42,8 @@ ENV MALLOC_ARENA_MAX=2
 ENV MALLOC_MMAP_THRESHOLD_=1048576
 COPY --from=rootfs /rootfs /
 EXPOSE 9000
-# How SnoutData Studio's "Find databases" knows this container is part of the SnoutData stack
-# (docs/desktop/DISCOVERY.md): by label, never by guessing from the image name. Only the
+# How SnoutData Studio's "Find databases" knows this container is part of the SnoutData stack:
+# by label, never by guessing from the image name. Only the
 # `postgres` component is offered as a database; the rest are recognised and left out.
 LABEL com.snoutdata.stack="1" com.snoutdata.component="functions"
 ENTRYPOINT ["/snout-functions"]

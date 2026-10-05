@@ -1,4 +1,4 @@
-# Its own workspace, not a member of packages/stack's (whose Cargo.toml excludes it): deno_runtime pins
+# Its own workspace, not a member of the stack's (whose Cargo.toml excludes it): deno_runtime pins
 # some dependencies exactly, rustls among them through deno_tls, and one lockfile would hold storage,
 # Realtime and push to those pins. Its own lockfile, deny.toml and profiles, the same toolchain.
 [workspace]
@@ -62,7 +62,7 @@ libc = "0.2"
 # This one line is what turns V8 on there; build.rs is empty and exists only so it counts.
 deno_core = "=0.412.0"
 
-# The workspace forbids unsafe code outright (X13). This crate DENIES it instead, which is the same
+# The workspace forbids unsafe code outright. This crate DENIES it instead, which is the same
 # everywhere but src/v8_memory.rs: the V8 embedding boundary, as pgrx is the Postgres one; and the
 # two modules that are system calls and nothing else, src/confine.rs and src/cpu.rs. The rest
 # of the workspace's lints are repeated here, because a crate that sets its own cannot also inherit.

@@ -18,8 +18,8 @@
 //! than the project's hard CPU limit, with a request in flight, stops the isolate. That is what a
 //! CPU limit protects (one busy loop starving every request its worker holds); work that yields
 //! is bounded by the wall clock instead. (Per busy period, as first built, charged a stream of
-//! short requests their sum and stopped a healthy worker under steady load: 4 errors in the
-//! 2026-09-29 bench. Per request since arrival would charge a long stream everyone else's CPU.)
+//! short requests their sum and stopped a healthy worker under steady load: 4 errors in a
+//! load test. Per request since arrival would charge a long stream everyone else's CPU.)
 //!
 //! That check alone let CPU through wherever no request was in flight or the thread yielded: a
 //! module looping at its top level, work after the response, slices shorter than the limit
