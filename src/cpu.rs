@@ -251,8 +251,8 @@ mod tests {
 
 	#[test]
 	fn a_steady_stream_of_requests_within_the_limit_is_never_stopped() {
-		// Sixty requests of a second's CPU each, all queued on one worker at once
-		// (docs/cloud/QA-RETEST.md §3f), and then a thousand more, one after another.
+		// Sixty requests of a second's CPU each, all queued on one worker at once, and
+		// then a thousand more, one after another.
 		let mut ledger = Ledger::new(UNIT, 0);
 		for _ in 0..60 {
 			ledger.grant();

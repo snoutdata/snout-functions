@@ -1,15 +1,15 @@
-# snout-functions' own cargo-deny policy: packages/stack/deny.toml, plus what its V8 runtime brings.
+# snout-functions' own cargo-deny policy: the stack's shared deny.toml, plus what its V8 runtime brings.
 # Everything added below says why; the target is to shed most of it when the runtime composes its
 # own, leaner set of Deno extensions.
 
-# What a dependency may be (X13, Q5). Run by scripts/check.sh and the pre-push hook.
+# What a dependency may be. Run by scripts/check.sh.
 
 [graph]
 all-features = true
 
 # Every licence here is compatible with shipping the stack under Apache-2.0. A copyleft
 # licence (GPL, AGPL, LGPL, MPL, SSPL) or a source-available one (BSL, Elastic) fails the
-# check: a dependency must never dictate the stack's own licence (Q5).
+# check: a dependency must never dictate the stack's own licence.
 [licenses]
 allow = [
 	"MIT",

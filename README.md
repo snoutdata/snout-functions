@@ -54,7 +54,7 @@ on threads of their own, with the memory, CPU and wall-clock limits its project'
 ## Running it
 
 ```sh
-podman build -f functions/Containerfile -t snout-functions .   # from packages/stack
+podman build -t snout-functions .
 podman run -v /srv/snoutfn:/snoutfn:ro -p 9000:9000 -e SNOUT_FUNCTIONS_DOOR_SECRET=... snout-functions
 ```
 
