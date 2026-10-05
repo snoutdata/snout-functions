@@ -21,6 +21,11 @@
 //! short requests their sum and stopped a healthy worker under steady load: 4 errors in the
 //! 2026-09-29 bench. Per request since arrival would charge a long stream everyone else's CPU.)
 //!
+//! That check alone let CPU through wherever no request was in flight or the thread yielded: a
+//! module looping at its top level, work after the response, slices shorter than the limit
+//! (audit 5-A). Those are stopped by each worker's CPU credit (cpu.rs), which a lease adds to
+//! and a watchdog thread charges whether the worker is starting, serving or idle.
+//!
 //! Room for a worker is counted twice: by number (`max_workers`) and by MEMORY. Every project on
 //! the host is in one container with one memory cap (1 GB on the fleet), and the kernel's answer to
 //! a container over its cap is to kill what is in it, every project at once. So past
@@ -128,6 +133,7 @@ impl Drop for Lease {
 	fn drop(&mut self) {
 		self.entry.last_used_ms.store(self.supervisor.now_ms(), Ordering::Release);
 		self.entry.inflight.fetch_sub(1, Ordering::AcqRel);
+		self.entry.worker.end_request();
 	}
 }
 
@@ -233,6 +239,7 @@ impl Supervisor {
 			match started {
 				Ok(entry) if entry.worker.alive() => {
 					entry.inflight.fetch_add(1, Ordering::AcqRel);
+					entry.worker.begin_request();
 					return Ok(Lease { entry, supervisor: self.clone() });
 				}
 				Ok(_) => {

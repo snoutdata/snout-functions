@@ -84,7 +84,12 @@ if [ $confined = 1 ]; then
 	check "b's root holds its own bundle and not a's" "$d_b" "$(ls "$views/isolationb01/bundles")"
 	check "a's root holds no manifest" "bundles etc proc sockets tmp" "$(ls "$views/isolationa01" | tr '\n' ' ' | sed 's/ $//')"
 	check "the binary its proc/self/exe names is still its owner's" "$owner" "$(stat -c %u "$bin")"
-	check "a's root is owned by a's user" "20000" "$(stat -c %u "$views/isolationa01/bundles")"
+	# Audit 5-C: root writes into a project's root while it runs, so the project owns only its
+	# /tmp and its socket's directory, and reads the rest through its group.
+	check "a's bundles are root's, readable by a's group alone" "0:20000:750" "$(stat -c %u:%g:%a "$views/isolationa01/bundles")"
+	check "a's root itself is root's" "0:20000:750" "$(stat -c %u:%g:%a "$views/isolationa01")"
+	check "a's /etc is root's" "0:20000:750" "$(stat -c %u:%g:%a "$views/isolationa01/etc")"
+	check "a owns its /tmp and its sockets' directory" "20000:20000 20000:20000" "$(stat -c %u:%g "$views/isolationa01/tmp" "$views/isolationa01/sockets" | tr '\n' ' ' | sed 's/ $//')"
 else
 	pid_a=""
 	check "each project has a process of its own" "yes" "$([ "$(pgrep -P "$server" | wc -l)" -ge 3 ] && echo yes || echo no)"

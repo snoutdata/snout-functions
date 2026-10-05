@@ -22,6 +22,7 @@
 //! `MEMORY_GUARD` the process holding the most is told to stop its largest worker.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -69,6 +70,8 @@ pub struct Project {
 	name: String,
 	socket: PathBuf,
 	pid: u32,
+	/// The user it runs as, where it is confined: the only one whose socket it may be.
+	uid: Option<u32>,
 	/// Its orders; dropped to stop it (its stdin closing ends it).
 	orders: tokio::sync::Mutex<Option<ChildStdin>>,
 	/// The manifest file's time when it was last sent, and the bundles in its directory.
@@ -267,6 +270,7 @@ impl Router {
 			name: name.to_owned(),
 			socket: view.join("sockets").join("front.sock"),
 			pid: spare.pid,
+			uid: self.confine.then_some(uid),
 			orders: tokio::sync::Mutex::new(Some(spare.stdin)),
 			sent: Mutex::new((stamp, digests.into_iter().collect())),
 			preparing: tokio::sync::Mutex::new(()),
@@ -433,8 +437,15 @@ fn digests(manifest: &Manifest) -> Vec<String> {
 }
 
 /// A project's directory: its bundles (copied from the mount, which it cannot see), a /tmp and
-/// its socket's directory, and the two files the resolver reads. Owned by the project's uid where
-/// it is confined, so it can read what it runs and nothing it does not.
+/// its socket's directory, and the two files the resolver reads.
+///
+/// Where it is confined, the project's user owns `tmp` and `sockets` and NOTHING else: the
+/// directory itself, `bundles`, `etc` and `proc` stay this process's (root's), readable by the
+/// project's group and writable by nobody but root. This process writes here as root every few
+/// seconds (`refresh`), so a project that owned what it writes into could plant a symlink (its
+/// `/etc/hosts` pointing at a host library, or a directory swapped for a link while it is walked)
+/// and have root truncate or chown a file outside it (audit 5-C). Root never writes into `tmp` or
+/// `sockets` after it has made them, and refuses a path here that is not what it made.
 ///
 /// A copy is replaced when the host has prepared its bundle again since (`build_state`), and
 /// the digests replaced are returned. A bundle is named by its source, not by its build, so a
@@ -444,16 +455,28 @@ fn digests(manifest: &Manifest) -> Vec<String> {
 /// the container was restarted.
 fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) -> Result<Vec<String>, String> {
 	let fail = |what: &Path, error: std::io::Error| format!("{}: {error}", what.display());
-	let fresh = !view.join("bundles").exists();
-	for dir in ["bundles", "etc", "tmp", "sockets"] {
+	if let Some(parent) = view.parent() {
+		std::fs::create_dir_all(parent).map_err(|e| fail(parent, e))?;
+	}
+	for dir in ["", "bundles", "etc", "proc", "proc/self"] {
+		let path = if dir.is_empty() { view.to_path_buf() } else { view.join(dir) };
+		shared_dir(&path, uid).map_err(|e| fail(&path, e))?;
+	}
+	for dir in ["tmp", "sockets"] {
 		let path = view.join(dir);
-		std::fs::create_dir_all(&path).map_err(|e| fail(&path, e))?;
+		owned_dir(&path, uid).map_err(|e| fail(&path, e))?;
 	}
 	for file in ["resolv.conf", "hosts"] {
 		let from = Path::new("/etc").join(file);
 		if from.exists() {
 			let to = view.join("etc").join(file);
-			std::fs::copy(&from, &to).map_err(|e| fail(&to, e))?;
+			// Copied beside it and renamed over it, so whatever is at `to` is replaced, never
+			// written through.
+			let next = view.join("etc").join(format!(".{file}.next"));
+			let _ = std::fs::remove_file(&next);
+			std::fs::copy(&from, &next).map_err(|e| fail(&next, e))?;
+			share(&next, uid, 0o640).map_err(|e| fail(&next, e))?;
+			std::fs::rename(&next, &to).map_err(|e| fail(&to, e))?;
 		}
 	}
 	// There is no /proc in a project's root, and Deno's `Deno.execPath()` (Node's `process.execPath`,
@@ -463,11 +486,9 @@ fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) ->
 	// Deno crates is allowed to fail.
 	let exe = view.join("proc").join("self").join("exe");
 	if std::fs::symlink_metadata(&exe).is_err() {
-		std::fs::create_dir_all(view.join("proc").join("self")).map_err(|e| fail(&exe, e))?;
 		let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/snout-functions"));
 		std::os::unix::fs::symlink(binary, &exe).map_err(|e| fail(&exe, e))?;
 	}
-	let mut copied = false;
 	let mut replaced = Vec::new();
 	for digest in digests {
 		let to = view.join("bundles").join(digest);
@@ -481,7 +502,7 @@ fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) ->
 		}
 		let partial = view.join("bundles").join(format!(".{digest}.partial"));
 		let _ = std::fs::remove_dir_all(&partial);
-		copy_dir(&from, &partial).map_err(|e| fail(&from, e))?;
+		copy_dir(&from, &partial, uid).map_err(|e| fail(&from, e))?;
 		// Swapped whole, so a worker starting now reads the old copy or the new one.
 		let old = view.join("bundles").join(format!(".{digest}.old"));
 		if stale {
@@ -493,14 +514,53 @@ fn prepare(view: &Path, bundles: &Path, digests: &[String], uid: Option<u32>) ->
 			let _ = std::fs::remove_dir_all(&old);
 			replaced.push(digest.clone());
 		}
-		copied = true;
-	}
-	if let Some(uid) = uid
-		&& (fresh || copied)
-	{
-		own(view, uid).map_err(|e| fail(view, e))?;
 	}
 	Ok(replaced)
+}
+
+/// A directory of the view that only this process writes: made if missing, refused if what is
+/// there is not a directory (a symlink is not followed), and, where the project is confined,
+/// readable and searchable by the project's group alone.
+fn shared_dir(path: &Path, uid: Option<u32>) -> std::io::Result<()> {
+	match std::fs::create_dir(path) {
+		Ok(()) => {}
+		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => real_dir(path)?,
+		Err(error) => return Err(error),
+	}
+	share(path, uid, 0o750)
+}
+
+/// A directory the project's user owns (its /tmp, its socket's): handed over the moment it is
+/// made, empty, and never touched by this process again.
+fn owned_dir(path: &Path, uid: Option<u32>) -> std::io::Result<()> {
+	match std::fs::create_dir(path) {
+		Ok(()) => {
+			if let Some(uid) = uid {
+				std::os::unix::fs::lchown(path, Some(uid), Some(uid))?;
+				std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+			}
+			Ok(())
+		}
+		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => real_dir(path),
+		Err(error) => Err(error),
+	}
+}
+
+/// That `path` is a directory itself, not a link to one.
+fn real_dir(path: &Path) -> std::io::Result<()> {
+	if std::fs::symlink_metadata(path)?.file_type().is_dir() {
+		Ok(())
+	} else {
+		Err(std::io::Error::other("not a directory of this process's own (a link is never followed here)"))
+	}
+}
+
+/// Something this process made in the view, readable by the project's group: `lchown` to the
+/// group alone (the owner stays root), and a mode with no write for anyone but the owner.
+fn share(path: &Path, uid: Option<u32>, mode: u32) -> std::io::Result<()> {
+	let Some(gid) = uid else { return Ok(()) };
+	std::os::unix::fs::lchown(path, None, Some(gid))?;
+	std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// What the host has made of a bundle's source (functionRuntime.ts writes `.built`): the builder
@@ -514,28 +574,19 @@ fn build_state(bundle: &Path) -> (String, Option<u64>, String) {
 	(read("builder"), size, read("error.txt"))
 }
 
-fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
-	std::fs::create_dir_all(to)?;
+/// A bundle copied into the view, in a directory only this process writes; links are skipped.
+fn copy_dir(from: &Path, to: &Path, uid: Option<u32>) -> std::io::Result<()> {
+	std::fs::create_dir(to)?;
+	share(to, uid, 0o750)?;
 	for entry in std::fs::read_dir(from)? {
 		let entry = entry?;
 		let kind = entry.file_type()?;
 		let target = to.join(entry.file_name());
 		if kind.is_dir() {
-			copy_dir(&entry.path(), &target)?;
+			copy_dir(&entry.path(), &target, uid)?;
 		} else if kind.is_file() {
 			std::fs::copy(entry.path(), &target)?;
-		}
-	}
-	Ok(())
-}
-
-/// The project's user owns its directory. `lchown`, never `chown`: the one link in it
-/// (proc/self/exe) names this binary, and following it would hand the binary to the project.
-fn own(path: &Path, uid: u32) -> std::io::Result<()> {
-	std::os::unix::fs::lchown(path, Some(uid), Some(uid))?;
-	if std::fs::symlink_metadata(path)?.is_dir() {
-		for entry in std::fs::read_dir(path)? {
-			own(&entry?.path(), uid)?;
+			share(&target, uid, 0o640)?;
 		}
 	}
 	Ok(())
@@ -628,7 +679,15 @@ async fn answer(request: Request<Incoming>, router: Arc<Router>) -> Reply {
 			}
 		};
 		match UnixStream::connect(&project.socket).await {
-			Ok(stream) => return forward(request, stream, project, deadline).await,
+			Ok(stream) if answered_by(&stream, project.uid) => return forward(request, stream, project, deadline).await,
+			// Its socket's directory is the project's own, so code that got out of its isolate could
+			// leave a link there to another project's socket: a request that passed THIS project's
+			// checks would then reach that one's functions. Only the project's own user may answer.
+			Ok(_) => {
+				eprintln!("{name}: its socket was answered by a process not its own, so its process was stopped");
+				router.stop(&project, "its socket was not its own");
+				break;
+			}
 			// A process that has gone since it was found: once more, with a new one.
 			Err(_) if attempt == 0 => router.stop(&project, "its socket did not answer"),
 			Err(error) => {
@@ -638,6 +697,11 @@ async fn answer(request: Request<Incoming>, router: Arc<Router>) -> Reply {
 		}
 	}
 	refuse(StatusCode::INTERNAL_SERVER_ERROR, "This function could not be run.", Some("its project's process did not answer"))
+}
+
+/// Whether the process listening on `stream` runs as `uid` (any process where none is confined).
+fn answered_by(stream: &UnixStream, uid: Option<u32>) -> bool {
+	uid.is_none_or(|uid| stream.peer_cred().is_ok_and(|peer| peer.uid() == uid))
 }
 
 async fn forward(mut request: Request<Incoming>, stream: UnixStream, project: Arc<Project>, deadline: tokio::time::Instant) -> Reply {
@@ -707,7 +771,8 @@ impl Body for Passing {
 
 #[cfg(test)]
 mod tests {
-	use super::prepare;
+	use super::{answered_by, prepare};
+	use std::os::unix::fs::{MetadataExt, PermissionsExt};
 	use std::path::{Path, PathBuf};
 
 	fn scratch(name: &str) -> PathBuf {
@@ -776,6 +841,85 @@ mod tests {
 		build(&bundles.join("d1"), "deno:2.9.8", Some("export {};"), None);
 		assert_eq!(prepare(&view, &bundles, &digests, None).unwrap(), digests);
 		assert_eq!(std::fs::read_to_string(view.join("bundles/d1/.built/builder")).unwrap().trim(), "deno:2.9.8");
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	// Audit 5-C: root writes into the view every few seconds, so nothing the project could have
+	// put there may be followed out of it.
+	#[test]
+	fn a_link_left_at_etc_hosts_is_replaced_and_never_written_through() {
+		if !Path::new("/etc/hosts").exists() {
+			return;
+		}
+		let root = scratch("hosts-link");
+		let (bundles, view) = (root.join("bundles"), root.join("view"));
+		prepare(&view, &bundles, &[], None).unwrap();
+		let victim = root.join("victim");
+		std::fs::write(&victim, "not the resolver's").unwrap();
+		std::fs::remove_file(view.join("etc/hosts")).unwrap();
+		std::os::unix::fs::symlink(&victim, view.join("etc/hosts")).unwrap();
+
+		prepare(&view, &bundles, &[], None).unwrap();
+		assert_eq!(std::fs::read_to_string(&victim).unwrap(), "not the resolver's");
+		assert!(std::fs::symlink_metadata(view.join("etc/hosts")).unwrap().file_type().is_file());
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn a_directory_swapped_for_a_link_is_refused_and_nothing_is_written_through_it() {
+		let root = scratch("dir-link");
+		let (bundles, view) = (root.join("bundles"), root.join("view"));
+		let digests = vec!["d1".to_owned()];
+		prepare(&view, &bundles, &[], None).unwrap();
+		let elsewhere = root.join("elsewhere");
+		std::fs::create_dir_all(&elsewhere).unwrap();
+		for dir in ["etc", "bundles", "tmp", "sockets", "proc"] {
+			let path = view.join(dir);
+			std::fs::rename(&path, root.join(format!("{dir}.was"))).unwrap();
+			std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+			assert!(prepare(&view, &bundles, &digests, None).is_err(), "{dir} as a link was followed");
+			std::fs::remove_file(&path).unwrap();
+			std::fs::rename(root.join(format!("{dir}.was")), &path).unwrap();
+		}
+		assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn a_confined_project_owns_its_tmp_and_sockets_and_can_only_read_the_rest() {
+		let root = scratch("modes");
+		let (bundles, view) = (root.join("bundles"), root.join("view"));
+		std::fs::set_permissions(bundles.join("d1/index.ts"), std::fs::Permissions::from_mode(0o600)).unwrap();
+		// The test's own user stands for the project's: lchown to it needs no privilege.
+		let me = std::fs::metadata(&root).unwrap();
+		if me.uid() != me.gid() {
+			return;
+		}
+		prepare(&view, &bundles, &["d1".to_owned()], Some(me.uid())).unwrap();
+		let mode = |path: &str| std::fs::symlink_metadata(view.join(path)).unwrap().mode() & 0o777;
+		for dir in ["", "bundles", "bundles/d1", "etc", "proc", "proc/self"] {
+			assert_eq!(mode(dir), 0o750, "{dir}");
+		}
+		assert_eq!(mode("bundles/d1/index.ts"), 0o640);
+		assert_eq!(mode("tmp"), 0o700);
+		assert_eq!(mode("sockets"), 0o700);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	#[test]
+	fn only_the_projects_own_user_may_answer_its_socket() {
+		let root = scratch("peer");
+		let path = root.join("front.sock");
+		let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+		let me = std::fs::metadata(&path).unwrap().uid();
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		runtime.block_on(async {
+			let stream = tokio::net::UnixStream::connect(&path).await.unwrap();
+			assert!(answered_by(&stream, None));
+			assert!(answered_by(&stream, Some(me)));
+			assert!(!answered_by(&stream, Some(me + 1)));
+		});
+		drop(listener);
 		let _ = std::fs::remove_dir_all(&root);
 	}
 }

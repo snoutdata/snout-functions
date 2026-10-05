@@ -147,9 +147,9 @@ pub fn allocator(limit: usize) -> (v8::UniqueRef<v8::Allocator>, Arc<Budget>) {
 	(allocator, budget)
 }
 
-/// A counter JavaScript writes with `Atomics` and Rust reads from any thread: the first four
-/// bytes of a SharedArrayBuffer, with the backing store that keeps them alive. The worker's
-/// request counter (isolate.rs, `Worker::stalled_ms`).
+/// A counter JavaScript writes with `Atomics` and Rust reads from any thread: one 32-bit slot of a
+/// SharedArrayBuffer, with the backing store that keeps it alive. The worker's request counter and
+/// whether it serves (isolate.rs, `INSTALL`).
 pub struct SharedCounter {
 	_store: v8::SharedRef<v8::BackingStore>,
 	count: *const AtomicI32,
@@ -164,12 +164,13 @@ unsafe impl Send for SharedCounter {}
 unsafe impl Sync for SharedCounter {}
 
 impl SharedCounter {
-	/// None for a buffer too short to hold a counter.
-	pub fn new(store: v8::SharedRef<v8::BackingStore>) -> Option<Self> {
-		if store.byte_length() < std::mem::size_of::<AtomicI32>() {
+	/// The `index`th 32-bit slot; None for a buffer too short to hold it.
+	pub fn new(store: v8::SharedRef<v8::BackingStore>, index: usize) -> Option<Self> {
+		if store.byte_length() < std::mem::size_of::<AtomicI32>() * (index + 1) {
 			return None;
 		}
-		let count = store.data()?.as_ptr().cast::<AtomicI32>().cast_const();
+		// SAFETY: in bounds, checked above; the store's data is aligned to `ALIGN`, a multiple of 4.
+		let count = unsafe { store.data()?.as_ptr().cast::<AtomicI32>().add(index) }.cast_const();
 		Some(Self { _store: store, count })
 	}
 
