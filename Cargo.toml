@@ -51,7 +51,8 @@ serde_json = "1"
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
-# The system calls that shut a project's process into its own directory and user (src/confine.rs).
+# The system calls that shut a project's process into its own directory and user (src/confine.rs),
+# and the per-thread CPU clock (src/cpu.rs).
 libc = "0.2"
 
 [build-dependencies]
@@ -62,7 +63,8 @@ libc = "0.2"
 deno_core = "=0.412.0"
 
 # The workspace forbids unsafe code outright (X13). This crate DENIES it instead, which is the same
-# everywhere but src/v8_memory.rs: the V8 embedding boundary, as pgrx is the Postgres one. The rest
+# everywhere but src/v8_memory.rs: the V8 embedding boundary, as pgrx is the Postgres one; and the
+# two modules that are system calls and nothing else, src/confine.rs and src/cpu.rs. The rest
 # of the workspace's lints are repeated here, because a crate that sets its own cannot also inherit.
 [lints.rust]
 unsafe_code = "deny"

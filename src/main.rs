@@ -23,6 +23,7 @@ macro_rules! debug {
 mod compress;
 mod compressible;
 mod confine;
+mod cpu;
 mod http;
 mod isolate;
 mod jwt;

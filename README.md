@@ -19,8 +19,9 @@ on threads of their own, with the memory, CPU and wall-clock limits its project'
   read from outside each process). The cost, on 2 cores with 20 projects warm: 10.3 MB a project
   against 8.0 in one process, a project's first request 7.4 ms against 3.1 (a spare process waits
   booted), a warm request 1.3 ms against 1.0 (`tests/project-cost-probe.sh`).
-- **Isolated by permissions, not by trust.** A worker may read its own bundle and read and write
-  its own socket directory, and reach the network; nothing else. No environment of the process, no
+- **Isolated by permissions, not by trust.** A worker may read its own bundle and its own socket
+  directory, and reach the network; nothing else. Its socket is bound by the runtime before the
+  function's code runs, so the function writes no file at all. No environment of the process, no
   subprocess, no FFI, no other file, and never this container's own loopback, where the runtime's
   port answers. `Deno.env` is the project's variables and only those.
 - **Proves where a request came from.** Every request must carry the front door's secret
@@ -28,7 +29,8 @@ on threads of their own, with the memory, CPU and wall-clock limits its project'
   worker sees the request. A function cannot call another project's functions by naming it.
 - **Limits that say which one was hit.** Memory is stopped at the allocation that crosses it
   (ArrayBuffers are counted by the runtime's own allocator) or at V8's heap limit; CPU is the
-  longest stretch a request holds its thread without yielding; the wall clock belongs to the
+  longest stretch a request holds its thread without yielding, and, over a worker's whole life
+  (loading, serving and idle), the CPU limit for each request it was given; the wall clock belongs to the
   request, all of it. The caller is told `it reached its memory limit`, `CPU limit` or
   `wall clock limit`, not a generic cancellation.
 - **Many requests, few workers.** One worker serves any number of requests that wait on I/O (100

@@ -5,10 +5,12 @@
 //! own HTTP server (streaming bodies both ways, WebSocket upgrades, trailers), and the only
 //! JavaScript of ours that runs in the isolate is the few lines of `INSTALL` below.
 //!
-//! What a worker may do, decided here and nowhere else: read its own bundle, read and write its
-//! own socket directory, reach the network (which the container's network then polices: the
+//! What a worker may do, decided here and nowhere else: read its own bundle, read its own socket
+//! directory, reach the network (which the container's network then polices: the
 //! metadata service and private ranges are refused there), and nothing else: no environment of
-//! the process, no subprocess, no FFI, no other file. `Deno.env` is replaced by the project's
+//! the process, no subprocess, no FFI, and no file written at all: the socket is bound by our own
+//! code before the function's runs, and write permission is gone before the function's first line
+//! (audit 5-B: a function could otherwise fill the host's disk). `Deno.env` is replaced by the project's
 //! own variables, so a worker sees exactly what its manifest says and never the runtime's own.
 //!
 //! An isolate is BOOTED before anyone needs it and CLAIMED by a function later (`Spares`): what
@@ -74,6 +76,9 @@ pub struct Worker {
 	requests: Option<crate::v8_memory::SharedCounter>,
 	requests_seen: AtomicI32,
 	request_ms: AtomicU64,
+	/// Its CPU over its whole life, against a credit per request (cpu.rs); None where the platform
+	/// has no thread CPU clock.
+	cpu: Option<Arc<crate::cpu::Meter>>,
 }
 
 impl Worker {
@@ -91,6 +96,19 @@ impl Worker {
 		}
 		self.isolate.terminate_execution();
 		self.stopping.notify_one();
+	}
+
+	/// A request is given to this worker, and brings its CPU limit to the worker's credit.
+	pub fn begin_request(&self) {
+		if let Some(cpu) = &self.cpu {
+			cpu.begin();
+		}
+	}
+
+	pub fn end_request(&self) {
+		if let Some(cpu) = &self.cpu {
+			cpu.end();
+		}
 	}
 
 	pub fn stopped_because(&self) -> Option<String> {
@@ -119,9 +137,25 @@ impl Worker {
 /// Our own few lines, run before the customer's module. They close over what they need and
 /// leave nothing on `globalThis`.
 const INSTALL: &str = r#"((socketPath, vars) => {
-	// Bumped as each request starts; read by the supervisor (`Requests`).
-	const requests = new Int32Array(new SharedArrayBuffer(4));
-	const serve = Deno.serve;
+	// [0] bumped as each request starts (`Worker::stalled_ms`); [1] set once the function serves.
+	const counters = new Int32Array(new SharedArrayBuffer(8));
+	const listen = Deno.listen;
+	const serveOn = Deno[Deno.internal].serveHttpOnListener;
+	const AddrInUse = Deno.errors.AddrInUse;
+	// The worker's socket, bound here, before any of the function's code runs: the only write this
+	// worker is ever allowed, and `run` takes the permission away as soon as this returns.
+	let bound = listen({ transport: "unix", path: socketPath });
+	const take = () => {
+		if (bound === null) throw new AddrInUse("Address already in use (os error 98)");
+		const listener = bound;
+		bound = null;
+		Atomics.store(counters, 1, 1);
+		return listener;
+	};
+	const failed = (error) => {
+		console.error(error);
+		return new Response(new TextEncoder().encode("Internal Server Error"), { status: 500 });
+	};
 	Object.defineProperty(Deno, "serve", {
 		configurable: true,
 		writable: true,
@@ -138,11 +172,11 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 				options = a ?? {};
 				handler = options.handler;
 			}
-			const { port, hostname, path, transport, cert, key, reusePort, onListen, handler: _, ...rest } = options;
+			const { signal, onError, automaticCompression } = options;
 			// Served on a Unix socket, a request's URL would read `http+unix://`; the function
 			// sees the address it was called at instead, as it would on a TCP listener.
 			const called = (request, info) => {
-				Atomics.add(requests, 0, 1);
+				Atomics.add(counters, 0, 1);
 				const at = new URL(request.url);
 				const url = "http://" + (request.headers.get("host") ?? "localhost") + at.pathname + at.search;
 				// Not `new Request(url, request)`: that copies the signal, and reading it asks Deno
@@ -150,7 +184,7 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 				const body = request.body;
 				const forwarded = new Request(url, { method: request.method, headers: request.headers, body, redirect: request.redirect, duplex: body ? "half" : undefined });
 				// A function that set its own onError handles its own failures, through Deno.
-				if (rest.onError) return handler(forwarded, info);
+				if (onError) return handler(forwarded, info);
 				// Otherwise a failure is answered the way clients expect: a handler that throws
 				// gets a plain-text 500, one that returns something that is not a Response a 502.
 				return (async () => {
@@ -168,7 +202,8 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 					return response;
 				})();
 			};
-			return serve({ ...rest, path: socketPath, handler: called, onListen() {} });
+			// What Deno.serve does with a `path`, on the socket bound above.
+			return serveOn(take(), signal, called, onError ?? failed, () => {}, automaticCompression);
 		},
 	});
 	const store = new Map(Object.entries(vars));
@@ -181,17 +216,16 @@ const INSTALL: &str = r#"((socketPath, vars) => {
 	};
 	Object.defineProperty(Deno, "env", { configurable: true, writable: false, value: env });
 	// Older functions serve with std/http's serve(), which listens on a port and hands each
-	// connection to Deno.serveHttp. That listener is pinned to the same socket.
-	const listen = Deno.listen;
+	// connection to Deno.serveHttp. That listener is the same socket.
 	Object.defineProperty(Deno, "listen", {
 		configurable: true,
 		writable: true,
 		value: function snoutListen(options) {
 			if (options && options.transport === "unix") return listen(options);
-			return listen({ transport: "unix", path: socketPath });
+			return take();
 		},
 	});
-	return requests.buffer;
+	return counters.buffer;
 })"#;
 
 type Ready = oneshot::Sender<Result<Arc<Worker>, String>>;
@@ -370,7 +404,7 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 	}
 	// What this worker may touch, now that it is somebody's.
 	*root.borrow_mut() = spec.bundle.clone();
-	match permissions_for(&spec, parser) {
+	match permissions_for(&spec, parser.clone(), true) {
 		Ok(permissions) => worker.js_runtime.op_state().borrow_mut().put(permissions),
 		Err(error) => {
 			let _ = ready.send(Err(error));
@@ -439,14 +473,45 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 			return;
 		}
 	};
-	let requests = {
+	// The socket is bound: from here the worker may write nothing (audit 5-B).
+	match permissions_for(&spec, parser, false) {
+		Ok(permissions) => worker.js_runtime.op_state().borrow_mut().put(permissions),
+		Err(error) => {
+			let _ = ready.send(Err(error));
+			return;
+		}
+	}
+	let (requests, served) = {
 		let runtime = &mut worker.js_runtime;
 		deno_core::scope!(scope, runtime);
 		let value = v8::Local::new(scope, &installed);
-		v8::Local::<v8::SharedArrayBuffer>::try_from(value)
-			.ok()
-			.and_then(|buffer| crate::v8_memory::SharedCounter::new(buffer.get_backing_store()))
+		let store = v8::Local::<v8::SharedArrayBuffer>::try_from(value).ok().map(|buffer| buffer.get_backing_store());
+		let counter = |index| store.clone().and_then(|store| crate::v8_memory::SharedCounter::new(store, index));
+		(counter(0), counter(1))
 	};
+	let Some(served) = served else {
+		let _ = ready.send(Err("the worker could not be prepared: no counters".into()));
+		return;
+	};
+	// Its CPU, from before the function's first line to its last (cpu.rs, audit 5-A).
+	let cpu = {
+		let isolate = worker.js_runtime.v8_isolate().thread_safe_handle();
+		let because = stopped_because.clone();
+		let wake = stopping.clone();
+		let label = spec.label.clone();
+		let unit_ms = spec.limits.hard_cpu();
+		crate::cpu::meter(unit_ms, move || {
+			eprintln!("{label}: stopped for CPU, past {unit_ms} ms for each request it was given");
+			if let Ok(mut held) = because.lock()
+				&& held.is_none()
+			{
+				*held = Some("CPU".to_owned());
+			}
+			isolate.terminate_execution();
+			wake.notify_one();
+		})
+	};
+	let _metered = Metered(cpu.clone());
 	let handle = Arc::new(Worker {
 		label: spec.label.clone(),
 		socket: socket.clone(),
@@ -461,6 +526,7 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 		requests,
 		requests_seen: AtomicI32::new(0),
 		request_ms: AtomicU64::new(0),
+		cpu,
 	});
 
 
@@ -472,7 +538,21 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 		}
 	};
 	debug!("{}: installed after {} us", spec.label, claimed_at.elapsed().as_micros());
-	let evaluated = tokio::time::timeout(Duration::from_millis(spec.limits.wall_ms), worker.execute_main_module(&main)).await;
+	// A module that holds the thread is stopped by its CPU credit; the watchdog's wake-up ends the
+	// wait for one that yields.
+	let evaluated = tokio::select! {
+		evaluated = tokio::time::timeout(Duration::from_millis(spec.limits.wall_ms), worker.execute_main_module(&main)) => Some(evaluated),
+		() = stopping.notified() => None,
+	};
+	let stopped = stopped_because.lock().ok().and_then(|held| held.clone());
+	if stopped.as_deref() == Some("CPU") {
+		let _ = ready.send(Err("the function's module used more than its CPU limit while it loaded".into()));
+		return;
+	}
+	let Some(evaluated) = evaluated else {
+		let _ = ready.send(Err(format!("the function's module failed to load: it was stopped ({})", stopped.as_deref().unwrap_or("unknown"))));
+		return;
+	};
 	match evaluated {
 		Err(_) => {
 			let _ = ready.send(Err("the function's module did not finish loading within its wall-clock limit".into()));
@@ -485,7 +565,7 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 		Ok(Ok(())) => {}
 	}
 	debug!("{}: module evaluated after {} us", spec.label, claimed_at.elapsed().as_micros());
-	if !socket.exists() {
+	if served.load() == 0 {
 		// An error thrown while the module loaded can surface only when the event loop runs; let
 		// it run a moment, so the caller hears that rather than "did not serve".
 		let surfaced = tokio::time::timeout(Duration::from_millis(100), worker.run_event_loop(false)).await;
@@ -541,19 +621,32 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 	let _ = std::fs::remove_dir_all(&spec.socket_dir);
 }
 
+/// Lets the CPU watchdog go when `run` returns, by whatever path.
+struct Metered(Option<Arc<crate::cpu::Meter>>);
+
+impl Drop for Metered {
+	fn drop(&mut self) {
+		if let Some(meter) = &self.0 {
+			meter.finish();
+		}
+	}
+}
+
 /// This container's own addresses, by name, which no worker may reach.
 const LOOPBACK: [&str; 5] = ["127.0.0.1", "localhost", "0.0.0.0", "[::1]", "[::]"];
 
-/// What a worker may do: read its own bundle, read and write its own socket directory, reach
-/// the network except this container's loopback, and nothing else.
-fn permissions_for(spec: &Spec, parser: Arc<RuntimePermissionDescriptorParser<Sys>>) -> Result<PermissionsContainer, String> {
+/// What a worker may do: read its own bundle and its own socket directory, reach the network
+/// except this container's loopback, and nothing else. `bind` adds the one write it is ever
+/// allowed, its socket's own path, for our code to bind it before the function's code runs.
+fn permissions_for(spec: &Spec, parser: Arc<RuntimePermissionDescriptorParser<Sys>>, bind: bool) -> Result<PermissionsContainer, String> {
 	let bundle = spec.bundle.to_string_lossy().into_owned();
 	let sockets = spec.socket_dir.to_string_lossy().into_owned();
+	let socket = spec.socket_dir.join("s.sock").to_string_lossy().into_owned();
 	let permissions = Permissions::from_options(
 		parser.as_ref(),
 		&PermissionsOptions {
-			allow_read: Some(vec![bundle, sockets.clone()]),
-			allow_write: Some(vec![sockets]),
+			allow_read: Some(vec![bundle, sockets]),
+			allow_write: bind.then(|| vec![socket]),
 			// Empty is "every host": the network the container is on is what refuses the metadata
 			// service and private ranges, measured in functions.pod.ts.
 			allow_net: Some(vec![]),

@@ -48,6 +48,19 @@ for (let i = 0; i < 40; i++) { try { const c = await Deno.connect({ transport: "
 await c.write(new TextEncoder().encode("GET / HTTP/1.1\r\nhost: x\r\nx-peer-probe: 1\r\nconnection: close\r\n\r\n")); const buf = new Uint8Array(4096); const n = await c.read(buf) ?? 0;
 (new TextDecoder().decode(buf.subarray(0, n)).endsWith("self") ? out.self : out.connected).push(i); c.close(); } catch (e) { out.error = e.name; } }
 return Response.json(out); });'
+# Audit 5-A: CPU with no request in flight, or in slices that yield; 5-B: no file written.
+d_top=$(printf 'top' | sha256sum | cut -c1-64)
+d_after=$(printf 'after' | sha256sum | cut -c1-64)
+d_slices=$(printf 'slices' | sha256sum | cut -c1-64)
+d_write=$(printf 'write' | sha256sum | cut -c1-64)
+bundle "$d_top" 'index.ts=for (;;) {}
+Deno.serve(() => new Response("never"));'
+bundle "$d_after" 'index.ts=Deno.serve(() => { setTimeout(() => { for (;;) {} }, 0); return new Response("sent"); });'
+bundle "$d_slices" 'index.ts=Deno.serve(() => { setInterval(() => { const end = Date.now() + 300; while (Date.now() < end) {} }, 5); return new Response("sent"); });'
+bundle "$d_write" 'index.ts=const server = Deno.serve(async () => { const dir = server.addr.path.replace(/\/s\.sock$/, ""); const out = {};
+for (const [name, path] of [["dir", dir + "/f0"], ["socket", server.addr.path], ["tmp", "/tmp/f0"]]) { try { await Deno.writeFile(path, new Uint8Array(16)); out[name] = "wrote"; } catch (e) { out[name] = e.name; } }
+try { await Deno.remove(server.addr.path); out.remove = "removed"; } catch (e) { out.remove = e.name; }
+return Response.json(out); });'
 bundle "$d_url" 'index.ts=Deno.serve((req) => Response.json({ url: req.url, host: req.headers.get("host"), env: Deno.env.toObject(), processEnvReadable: (() => { try { return typeof Deno.env.get("PATH"); } catch (e) { return "refused"; } })() }));'
 
 manifest() { # env json
@@ -56,7 +69,8 @@ manifest() { # env json
 { "ref": "$ref", "functions": [
 	{ "name": "hello", "digest": "$d_hello" }, { "name": "ts", "digest": "$d_ts" },
 	{ "name": "mem", "digest": "$d_mem" }, { "name": "cpu", "digest": "$d_cpu" },
-	{ "name": "sleep", "digest": "$d_sleep" }, { "name": "work", "digest": "$d_work" }, { "name": "loop", "digest": "$d_loop" }, { "name": "url", "digest": "$d_url" }, { "name": "peer", "digest": "$d_peer" }, { "name": "burn", "digest": "$d_burn" } ],
+	{ "name": "sleep", "digest": "$d_sleep" }, { "name": "work", "digest": "$d_work" }, { "name": "loop", "digest": "$d_loop" }, { "name": "url", "digest": "$d_url" }, { "name": "peer", "digest": "$d_peer" }, { "name": "burn", "digest": "$d_burn" },
+	{ "name": "top", "digest": "$d_top" }, { "name": "after", "digest": "$d_after" }, { "name": "slices", "digest": "$d_slices" }, { "name": "write", "digest": "$d_write" } ],
   "limits": { "memoryMb": 128, "wallMs": 30000, "cpuMs": 2000, "hardCpuMs": 3500 }, "env": $1 }
 JSON
 	mv "$root/projects/$ref.json.tmp" "$root/projects/$ref.json"
@@ -123,6 +137,16 @@ check "memory limit is named" "1" "$(printf '%s' "$out" | grep -c 'memory limit'
 started=$(date +%s%3N); out="$(call /cpu)"; echo "busy loop: $out in $(( $(date +%s%3N) - started )) ms"
 check "CPU limit is named" "1" "$(printf '%s' "$out" | grep -c 'CPU limit')"
 check "hello still answers after another worker was stopped" "ok" "$(call /hello)"
+started=$(date +%s%3N); out="$(call /top)"; echo "a module looping at its top level: $out in $(( $(date +%s%3N) - started )) ms"
+check "a module that never finishes loading is stopped for CPU" "1" "$(printf '%s' "$out" | grep -c 'CPU limit')"
+check "work after the response is answered first" "sent" "$(call /after)"
+check "slices that yield are answered first" "sent" "$(call /slices)"
+sleep 6
+check "work after the response is stopped for CPU" "1" "$(grep -c '/after: stopped for CPU' "$root/server.log")"
+check "slices that yield are stopped for CPU" "1" "$(grep -c '/slices: stopped for CPU' "$root/server.log")"
+out="$(call /write)"; echo "a worker writing files: $out"
+check "a worker writes no file, in its socket's directory or anywhere" "0" "$(printf '%s' "$out" | grep -c 'wrote\|removed')"
+check "hello still answers after all of it" "ok" "$(call /hello)"
 echo "anon MB now: $(awk '/RssAnon/{printf "%.1f", $2/1024}' /proc/$server/status)"
 echo "--- server log"; tail -20 "$root/server.log"
 echo "passed $pass, failed $fail"
