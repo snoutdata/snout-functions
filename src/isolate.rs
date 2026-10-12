@@ -394,6 +394,8 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 	let socket = spec.socket_dir.join("s.sock");
 	let claimed_at = std::time::Instant::now();
 	debug!("{}: claimed", spec.label);
+	// What this thread prints is this function's from here on (console.rs).
+	crate::console::claim(&spec.label);
 	if let Some(error) = preparation_failed(&spec.bundle) {
 		let _ = ready.send(Err(format!("its imports could not be prepared: {error}")));
 		return;
@@ -695,6 +697,8 @@ fn boot_isolate(memory_mb: u32) -> Result<Booted, String> {
 		residual_lazy_js_sources: deno_snapshots::RESIDUAL_LAZY_JS,
 		residual_lazy_esm_sources: deno_snapshots::RESIDUAL_LAZY_ESM,
 		create_params: Some(v8::CreateParams::default().heap_limits(0, limit).array_buffer_allocator(allocator.make_shared())),
+		// `console` output, attributed to the function that printed it.
+		extensions: vec![crate::console::extension()],
 		..Default::default()
 	};
 	let worker = MainWorker::bootstrap_from_options::<DenoInNpmPackageChecker, NpmResolver<Sys>, Sys>(

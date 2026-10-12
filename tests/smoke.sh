@@ -61,6 +61,9 @@ bundle "$d_write" 'index.ts=const server = Deno.serve(async () => { const dir = 
 for (const [name, path] of [["dir", dir + "/f0"], ["socket", server.addr.path], ["tmp", "/tmp/f0"]]) { try { await Deno.writeFile(path, new Uint8Array(16)); out[name] = "wrote"; } catch (e) { out[name] = e.name; } }
 try { await Deno.remove(server.addr.path); out.remove = "removed"; } catch (e) { out.remove = e.name; }
 return Response.json(out); });'
+# What a function prints leaves as one JSON line naming the project and function (src/console.rs).
+d_log=$(printf 'log' | sha256sum | cut -c1-64)
+bundle "$d_log" 'index.ts=Deno.serve(() => { console.log("hello", { n: 1 }); console.error("oops\nline two"); console.log("%d items", 3); return new Response("logged"); });'
 bundle "$d_url" 'index.ts=Deno.serve((req) => Response.json({ url: req.url, host: req.headers.get("host"), env: Deno.env.toObject(), processEnvReadable: (() => { try { return typeof Deno.env.get("PATH"); } catch (e) { return "refused"; } })() }));'
 
 manifest() { # env json
@@ -70,7 +73,7 @@ manifest() { # env json
 	{ "name": "hello", "digest": "$d_hello" }, { "name": "ts", "digest": "$d_ts" },
 	{ "name": "mem", "digest": "$d_mem" }, { "name": "cpu", "digest": "$d_cpu" },
 	{ "name": "sleep", "digest": "$d_sleep" }, { "name": "work", "digest": "$d_work" }, { "name": "loop", "digest": "$d_loop" }, { "name": "url", "digest": "$d_url" }, { "name": "peer", "digest": "$d_peer" }, { "name": "burn", "digest": "$d_burn" },
-	{ "name": "top", "digest": "$d_top" }, { "name": "after", "digest": "$d_after" }, { "name": "slices", "digest": "$d_slices" }, { "name": "write", "digest": "$d_write" } ],
+	{ "name": "top", "digest": "$d_top" }, { "name": "after", "digest": "$d_after" }, { "name": "slices", "digest": "$d_slices" }, { "name": "write", "digest": "$d_write" }, { "name": "log", "digest": "$d_log" } ],
   "limits": { "memoryMb": 128, "wallMs": 30000, "cpuMs": 2000, "hardCpuMs": 3500 }, "env": $1 }
 JSON
 	mv "$root/projects/$ref.json.tmp" "$root/projects/$ref.json"
@@ -95,6 +98,12 @@ echo "cold hello: $(ms /hello) ms"
 check "hello" "ok" "$(call /hello)"
 warm=(); for _ in $(seq 1 200); do warm+=("$(ms /hello)"); done
 echo "warm hello over 200 (curl, a new connection each): p50 $(printf '%s\n' "${warm[@]}" | sort -n | sed -n 100p) ms, p99 $(printf '%s\n' "${warm[@]}" | sort -n | sed -n 198p) ms"
+check "a function that prints answers" "logged" "$(call /log)"
+sleep 0.2
+logged() { grep '"snout_log":1' "$root/server.log" | grep "\"project\":\"$ref\"" | grep '"function":"log"' | grep "$1" | grep -c "$2"; }
+check "console.log leaves as a line naming its project and function" "1" "$(logged '"level":"log"' '"msg":"hello { n: 1 }"')"
+check "console.error too, a multi-line message on one line" "1" "$(logged '"level":"error"' '"msg":"oops\\nline two"')"
+check "format specifiers are Deno's own" "1" "$(logged '"level":"log"' '"msg":"3 items"')"
 check "typescript + relative import + env" "hello world" "$(call /ts)"
 manifest '{"WHO":"changed"}'
 check "a changed secret reaches the next request" "hello changed" "$(call /ts)"
