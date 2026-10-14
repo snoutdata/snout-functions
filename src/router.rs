@@ -640,13 +640,13 @@ async fn answer(request: Request<Incoming>, router: Arc<Router>) -> Reply {
 		return refuse(StatusCode::FORBIDDEN, "This request did not arrive through the front door.", None);
 	}
 	let Some(name) = request.headers().get("x-snoutdata-ref").and_then(|v| v.to_str().ok()).map(str::to_owned) else {
-		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", Some("Call https://<ref>.api.snoutdata.com/v1/fn/<name>"));
+		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", Some("Call https://<ref>.api.snoutdata.com/functions/v1/<name>"));
 	};
 	if !manifest::valid_ref(&name) {
 		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", None);
 	}
 	let Some(function) = manifest::function_name(request.uri().path()).map(str::to_owned) else {
-		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some("The path is /v1/fn/<name>"));
+		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some("The path is /functions/v1/<name>"));
 	};
 	// Decided here, so no process is started for a function that does not exist.
 	let Some((manifest, wall_ms, refused)) = router.manifests.get(&name).and_then(|m| {

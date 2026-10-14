@@ -3,8 +3,8 @@
 //!
 //! The front door checks the `apikey` header against the key hashes it holds (hashes only, so
 //! it cannot check a signature) and passes `Authorization` through. Until 0.2.2 nothing checked it,
-//! so a function marked "key required" ran for any caller holding the public app key, whatever
-//! token it sent: a forged, unsigned `snout_server` token reached the function, and a function
+//! so a function marked "key required" ran for any caller holding the public anon key, whatever
+//! token it sent: a forged, unsigned `service_role` token reached the function, and a function
 //! written for the upstream gateway that reads the user from the token's claims was impersonable. The
 //! host already holds each project's secret for Realtime, so the manifest carries it here and the
 //! runtime checks it before a function's process is even started.
@@ -97,34 +97,34 @@ mod tests {
 
 	#[test]
 	fn a_token_this_secret_signed_passes_until_it_expires() {
-		let token = sign(HS256, r#"{"role":"snout_app","exp":2000}"#, "s3cret");
+		let token = sign(HS256, r#"{"role":"anon","exp":2000}"#, "s3cret");
 		assert_eq!(check(Some(&bearer(&token)), "s3cret", 1999), Ok(()));
 		assert_eq!(check(Some(&bearer(&token)), "s3cret", 2000), Err(Refused::Invalid));
 		// The scheme is case-insensitive, as HTTP's is.
 		assert_eq!(check(Some(format!("bearer {token}").as_bytes()), "s3cret", 0), Ok(()));
 		// No `exp` is no expiry, as PostgREST reads it.
-		let forever = sign(HS256, r#"{"role":"snout_app"}"#, "s3cret");
+		let forever = sign(HS256, r#"{"role":"anon"}"#, "s3cret");
 		assert_eq!(check(Some(&bearer(&forever)), "s3cret", u64::MAX / 2), Ok(()));
 	}
 
 	#[test]
 	fn a_forged_or_foreign_token_is_refused() {
-		// The live case: claims of snout_server with no real signature.
-		let forged = format!("{}.{}.AAAA", URL.encode(HS256), URL.encode(r#"{"role":"snout_server","exp":9999999999}"#));
+		// The live case: claims of service_role with no real signature.
+		let forged = format!("{}.{}.AAAA", URL.encode(HS256), URL.encode(r#"{"role":"service_role","exp":9999999999}"#));
 		assert_eq!(check(Some(&bearer(&forged)), "s3cret", 0), Err(Refused::Invalid));
 		// Another project's secret.
-		let other = sign(HS256, r#"{"role":"snout_server"}"#, "other");
+		let other = sign(HS256, r#"{"role":"service_role"}"#, "other");
 		assert_eq!(check(Some(&bearer(&other)), "s3cret", 0), Err(Refused::Invalid));
 		// A changed payload under the original signature.
-		let real = sign(HS256, r#"{"role":"snout_app"}"#, "s3cret");
+		let real = sign(HS256, r#"{"role":"anon"}"#, "s3cret");
 		let mut parts: Vec<&str> = real.split('.').collect();
-		let swapped = URL.encode(r#"{"role":"snout_server"}"#);
+		let swapped = URL.encode(r#"{"role":"service_role"}"#);
 		parts[1] = &swapped;
 		assert_eq!(check(Some(&bearer(&parts.join("."))), "s3cret", 0), Err(Refused::Invalid));
 		// alg none, and another algorithm.
-		let none = format!("{}.{}.", URL.encode(r#"{"alg":"none"}"#), URL.encode(r#"{"role":"snout_server"}"#));
+		let none = format!("{}.{}.", URL.encode(r#"{"alg":"none"}"#), URL.encode(r#"{"role":"service_role"}"#));
 		assert_eq!(check(Some(&bearer(&none)), "s3cret", 0), Err(Refused::Invalid));
-		let rs = sign(r#"{"alg":"RS256"}"#, r#"{"role":"snout_app"}"#, "s3cret");
+		let rs = sign(r#"{"alg":"RS256"}"#, r#"{"role":"anon"}"#, "s3cret");
 		assert_eq!(check(Some(&bearer(&rs)), "s3cret", 0), Err(Refused::Invalid));
 		// A string expiry is not a number we can compare.
 		let odd = sign(HS256, r#"{"exp":"never"}"#, "s3cret");

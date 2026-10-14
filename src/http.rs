@@ -112,13 +112,13 @@ async fn answer(request: Request<Incoming>, state: Arc<State>) -> Reply {
 		return refuse(StatusCode::FORBIDDEN, "This request did not arrive through the front door.", None);
 	}
 	let Some(project) = request.headers().get("x-snoutdata-ref").and_then(|v| v.to_str().ok()).map(str::to_owned) else {
-		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", Some("Call https://<ref>.api.snoutdata.com/v1/fn/<name>"));
+		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", Some("Call https://<ref>.api.snoutdata.com/functions/v1/<name>"));
 	};
 	if !manifest::valid_ref(&project) {
 		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", None);
 	}
 	let Some(name) = manifest::function_name(request.uri().path()).map(str::to_owned) else {
-		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some("The path is /v1/fn/<name>"));
+		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some("The path is /functions/v1/<name>"));
 	};
 	let manifest = state.manifests.get(&project);
 	let Some((manifest, deployed)) = manifest.and_then(|m| {

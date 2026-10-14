@@ -1,7 +1,7 @@
 # cargo-audit's exceptions for this workspace, read by scripts/check.sh (which runs cargo audit
 # from this directory, since cargo-audit finds its config at ./.cargo/audit.toml).
 #
-# The first four are the advisories ../deny.toml ignores for cargo-deny; their reasons are there.
+# The first eight are the advisories ../deny.toml ignores for cargo-deny; their reasons are there.
 # The other four only cargo-audit reports: they are informational (unmaintained, unsound) and on
 # crates below a dependency, which deny.toml's `workspace` scope leaves out and cargo-audit's
 # --deny warnings does not. Each arrives through deno_runtime 0.267.0, the newest published on
@@ -16,6 +16,10 @@ ignore = [
 	"RUSTSEC-2026-0118", # hickory-proto: resolver not used
 	"RUSTSEC-2026-0119", # hickory-proto: resolver not used
 	"RUSTSEC-2023-0071", # rsa (Marvin): no fixed release
+	"RUSTSEC-2026-0346", # rustls pinned =0.23.40: custom session stores only
+	"RUSTSEC-2026-0347", # rustls pinned =0.23.40: ECH, never configured
+	"RUSTSEC-2026-0348", # rustls pinned =0.23.40: brotli feature, off
+	"RUSTSEC-2026-0349", # rustls pinned =0.23.40: post-quantum downgrade, server still authenticated
 	# rand 0.8.5, unsound: pinned =0.8.5 by deno_crypto 0.273 (fixed in 0.8.6, which cargo update
 	# cannot take). Unsound only when rand's `log` feature is on and a custom logger calls
 	# thread_rng while it reseeds. `log` is not enabled anywhere in this graph

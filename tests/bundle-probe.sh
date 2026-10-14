@@ -34,8 +34,8 @@ case_ esmsh 'import { nanoid } from "https://esm.sh/nanoid@5.0.7";
 Deno.serve(() => new Response(nanoid().length.toString()));'
 case_ stdserve 'import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
 serve(() => new Response("std serve"));'
-case_ client 'import { snout } from "npm:@snoutdata/client@0.1";
-const client = snout("http://127.0.0.1:1", "key");
+case_ client 'import { createClient } from "npm:@snoutdata/client@0.1";
+const client = createClient("http://127.0.0.1:1", "key");
 Deno.serve(() => new Response(typeof client.from));'
 case_ nodebuiltins 'import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
