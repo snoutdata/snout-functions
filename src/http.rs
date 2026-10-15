@@ -34,6 +34,11 @@ use crate::manifest::{self, Manifests};
 use crate::supervisor::{Key, Lease, Refusal, Supervisor};
 
 pub const HEALTH_PATH: &str = "/_snoutpod/health";
+/// Where a function is called, in the hints a refusal carries: the door's new prefix
+/// (the own layout). The old one, `/functions/v1`, still reaches it.
+pub const FRONT_DOOR_HINT: &str = "Call https://<ref>.api.snoutdata.com/v1/fn/<name>";
+pub const FUNCTION_PATH_HINT: &str = "The path is /v1/fn/<name>";
+
 /// The header the front door proves itself with, and the variable its value is read from.
 pub const DOOR_HEADER: &str = "x-snoutdata-door";
 pub const DOOR_ENV: &str = "SNOUT_FUNCTIONS_DOOR_SECRET";
@@ -112,13 +117,13 @@ async fn answer(request: Request<Incoming>, state: Arc<State>) -> Reply {
 		return refuse(StatusCode::FORBIDDEN, "This request did not arrive through the front door.", None);
 	}
 	let Some(project) = request.headers().get("x-snoutdata-ref").and_then(|v| v.to_str().ok()).map(str::to_owned) else {
-		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", Some("Call https://<ref>.api.snoutdata.com/functions/v1/<name>"));
+		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", Some(FRONT_DOOR_HINT));
 	};
 	if !manifest::valid_ref(&project) {
 		return refuse(StatusCode::BAD_REQUEST, "This request did not arrive through the front door.", None);
 	}
 	let Some(name) = manifest::function_name(request.uri().path()).map(str::to_owned) else {
-		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some("The path is /functions/v1/<name>"));
+		return refuse(StatusCode::NOT_FOUND, "No function was named in this request.", Some(FUNCTION_PATH_HINT));
 	};
 	let manifest = state.manifests.get(&project);
 	let Some((manifest, deployed)) = manifest.and_then(|m| {
@@ -256,7 +261,13 @@ fn full(body: String) -> BoxBody<Bytes, Error> {
 
 #[cfg(test)]
 mod tests {
-	use super::through_door;
+	use super::{FRONT_DOOR_HINT, FUNCTION_PATH_HINT, through_door};
+
+	#[test]
+	fn the_hints_name_the_new_prefix() {
+		assert_eq!(FRONT_DOOR_HINT, "Call https://<ref>.api.snoutdata.com/v1/fn/<name>");
+		assert_eq!(FUNCTION_PATH_HINT, "The path is /v1/fn/<name>");
+	}
 
 	#[test]
 	fn only_the_door_secret_passes() {
