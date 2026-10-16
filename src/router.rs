@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 
@@ -92,6 +92,9 @@ struct Spare {
 	stdin: ChildStdin,
 	stdout: Lines<BufReader<ChildStdout>>,
 	alive: Arc<AtomicBool>,
+	/// The project it was given, set here before the order that gives it: what `relay` tags its
+	/// stderr with.
+	owner: Arc<OnceLock<String>>,
 }
 
 pub struct Router {
@@ -170,7 +173,9 @@ impl Router {
 	/// Start a process that waits for a project.
 	fn spawn_spare(&self) -> Result<Spare, String> {
 		let mut command = tokio::process::Command::new(&self.binary);
-		command.arg("project").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+		// Its stderr is a pipe of its own, read by `relay`, never this container's: a function can
+		// write to it directly (`Deno.stderr`), so only this process may say whose a line is.
+		command.arg("project").env_clear().stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 		for name in PASSED {
 			if let Some(value) = std::env::var_os(name) {
 				command.env(name, value);
@@ -180,13 +185,16 @@ impl Router {
 		let pid = child.id().unwrap_or(0);
 		let stdin = child.stdin.take().ok_or("no stdin")?;
 		let stdout = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
+		let stderr = child.stderr.take().ok_or("no stderr")?;
+		let owner = Arc::new(OnceLock::new());
+		tokio::spawn(relay(stderr, owner.clone(), std::io::stderr()));
 		let alive = Arc::new(AtomicBool::new(true));
 		let dead = alive.clone();
 		tokio::spawn(async move {
 			let _ = child.wait().await;
 			dead.store(false, Ordering::Release);
 		});
-		Ok(Spare { pid, stdin, stdout, alive })
+		Ok(Spare { pid, stdin, stdout, alive, owner })
 	}
 
 	/// Keep `spare_count` processes waiting.
@@ -259,6 +267,11 @@ impl Router {
 			None => self.spawn_spare()?,
 		};
 		self.keep_spares();
+		// Before the order, so every line the project's code can write is tagged with its project:
+		// none of it runs until the process has read this.
+		if spare.owner.set(name.to_owned()).is_err() {
+			return Err("its process was already given a project".into());
+		}
 		let assign = serde_json::json!({ "assign": { "project": name, "uid": uid, "view": view, "confine": self.confine, "manifest": manifest } });
 		spare.stdin.write_all(format!("{assign}\n").as_bytes()).await.map_err(|error| format!("its process did not take the project: {error}"))?;
 		let ready = tokio::time::timeout(Duration::from_secs(10), spare.stdout.next_line()).await;
@@ -419,6 +432,58 @@ impl Router {
 			}
 		}
 	}
+}
+
+/// The longest line `relay` holds before writing it as it is: past it, the rest is a line of its
+/// own (tagged the same). A console line is at most 4 KB of text, escaped into JSON.
+const RELAY_LINE: usize = 64 * 1024;
+
+/// One project's process's stderr, line by line, onto this process's own (`out`), each line
+/// tagged `[<project>] ` from `owner`: this process's record of which project it gave that
+/// process, never anything the line says. A host that collects function logs reads these tags
+/// only, so a function writing `{"project": "<another>"}` to `Deno.stderr` writes it into its own
+/// project's name, where it is refused.
+///
+/// A line written before the process was given a project (a spare booting) is `[spare] `; no
+/// project's code has run in it yet. Every line is written whole, with one `write_all` under
+/// the stderr lock, so two processes' lines never interleave inside one.
+async fn relay<R, W>(mut from: R, owner: Arc<OnceLock<String>>, mut out: W)
+where
+	R: tokio::io::AsyncRead + Unpin,
+	W: std::io::Write,
+{
+	use tokio::io::AsyncReadExt;
+	let mut held: Vec<u8> = Vec::new();
+	let mut chunk = [0u8; 8192];
+	loop {
+		let read = match from.read(&mut chunk).await {
+			Ok(0) | Err(_) => break,
+			Ok(read) => read,
+		};
+		held.extend_from_slice(&chunk[..read]);
+		while let Some(end) = held.iter().position(|&b| b == b'\n') {
+			let line: Vec<u8> = held.drain(..=end).collect();
+			write_tagged(&mut out, &owner, &line[..end]);
+		}
+		while held.len() > RELAY_LINE {
+			let line: Vec<u8> = held.drain(..RELAY_LINE).collect();
+			write_tagged(&mut out, &owner, &line);
+		}
+	}
+	if !held.is_empty() {
+		write_tagged(&mut out, &owner, &held);
+	}
+}
+
+fn write_tagged<W: std::io::Write>(out: &mut W, owner: &OnceLock<String>, line: &[u8]) {
+	let tag = owner.get().map_or("spare", String::as_str);
+	let mut tagged = Vec::with_capacity(line.len() + tag.len() + 4);
+	tagged.push(b'[');
+	tagged.extend_from_slice(tag.as_bytes());
+	tagged.extend_from_slice(b"] ");
+	tagged.extend_from_slice(line.strip_suffix(b"\r").unwrap_or(line));
+	tagged.push(b'\n');
+	let _ = out.write_all(&tagged);
 }
 
 /// How often `refresh` runs, in `watch`'s 100 ms ticks.
@@ -771,7 +836,8 @@ impl Body for Passing {
 
 #[cfg(test)]
 mod tests {
-	use super::{answered_by, prepare};
+	use super::{RELAY_LINE, answered_by, prepare, relay};
+	use std::sync::{Arc, OnceLock};
 	use std::os::unix::fs::{MetadataExt, PermissionsExt};
 	use std::path::{Path, PathBuf};
 
@@ -921,5 +987,48 @@ mod tests {
 		});
 		drop(listener);
 		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	fn relayed(owner: Option<&str>, written: &[u8]) -> Vec<String> {
+		let tag = Arc::new(OnceLock::new());
+		if let Some(owner) = owner {
+			tag.set(owner.to_owned()).unwrap();
+		}
+		let mut out: Vec<u8> = Vec::new();
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		runtime.block_on(relay(written, tag, &mut out));
+		String::from_utf8(out).unwrap().lines().map(str::to_owned).collect()
+	}
+
+	#[test]
+	fn a_line_naming_another_project_is_tagged_with_the_project_that_wrote_it() {
+		// What a function can write with Deno.stderr, past console, in a neighbour's name.
+		let forged = b"{\"snout_log\":1,\"project\":\"vypqzymk1676s\",\"function\":\"hello\",\"level\":\"error\",\"at\":1,\"msg\":\"x\"}\nvypqzymk1676s/hello: stopped for CPU\n";
+		let lines = relayed(Some("h7a9mq1znhc77"), forged);
+		assert_eq!(lines.len(), 2);
+		assert!(lines.iter().all(|line| line.starts_with("[h7a9mq1znhc77] ")), "{lines:?}");
+		assert!(lines[0].ends_with("\"msg\":\"x\"}"));
+	}
+
+	#[test]
+	fn no_line_it_writes_starts_with_a_tag_of_its_own_choosing() {
+		let lines = relayed(Some("h7a9mq1znhc77"), b"a\n[vypqzymk1676s] {\"snout_log\":1}\r\n\n[vypqzymk1676s] no newline");
+		assert_eq!(
+			lines,
+			vec!["[h7a9mq1znhc77] a", "[h7a9mq1znhc77] [vypqzymk1676s] {\"snout_log\":1}", "[h7a9mq1znhc77] ", "[h7a9mq1znhc77] [vypqzymk1676s] no newline"]
+		);
+	}
+
+	#[test]
+	fn a_process_given_no_project_yet_is_a_spare() {
+		assert_eq!(relayed(None, b"booting\n"), vec!["[spare] booting"]);
+	}
+
+	#[test]
+	fn a_line_with_no_end_is_cut_and_every_piece_is_tagged() {
+		let long = vec![b'x'; RELAY_LINE * 2 + 10];
+		let lines = relayed(Some("h7a9mq1znhc77"), &long);
+		assert_eq!(lines.len(), 3);
+		assert!(lines.iter().all(|line| line.starts_with("[h7a9mq1znhc77] ") && line.len() <= RELAY_LINE + 16));
 	}
 }
