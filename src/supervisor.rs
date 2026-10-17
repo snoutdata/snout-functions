@@ -337,6 +337,13 @@ impl Supervisor {
 						if inflight > 0 {
 							let stalled = entry.worker.stalled_ms();
 							if stalled > entry.worker.limits.hard_cpu() {
+								// The same line the CPU meter prints: a loop that never yields is stopped
+								// here first, and this line is what the function's own log shows for it.
+								eprintln!(
+									"{}: stopped for CPU, past {} ms for each request it was given",
+									entry.worker.label,
+									entry.worker.limits.hard_cpu()
+								);
 								entry.worker.stop("CPU");
 								return false;
 							}
