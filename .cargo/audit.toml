@@ -1,7 +1,7 @@
 # cargo-audit's exceptions for this workspace, read by scripts/check.sh (which runs cargo audit
 # from this directory, since cargo-audit finds its config at ./.cargo/audit.toml).
 #
-# The first ten are the advisories ../deny.toml ignores for cargo-deny; their reasons are there.
+# The first eleven are the advisories ../deny.toml ignores for cargo-deny; their reasons are there.
 # The other four only cargo-audit reports: they are informational (unmaintained, unsound) and on
 # crates below a dependency, which deny.toml's `workspace` scope leaves out and cargo-audit's
 # --deny warnings does not. Each arrives through deno_runtime 0.267.0, the newest published on
@@ -22,6 +22,7 @@ ignore = [
 	"RUSTSEC-2026-0349", # rustls pinned =0.23.40: post-quantum downgrade, server still authenticated
 	"RUSTSEC-2026-0381", # webpki-roots 0.26.11: a shim over the fixed 1.0.10
 	"RUSTSEC-2026-0383", # webpki-root-certs 0.26.11: a shim over the fixed 1.0.10
+	"RUSTSEC-2026-0387", # crypto-bigint 0.5.5 via elliptic-curve 0.13 (deno_crypto): fixed only in 0.7.6
 	# rand 0.8.5, unsound: pinned =0.8.5 by deno_crypto 0.273 (fixed in 0.8.6, which cargo update
 	# cannot take). Unsound only when rand's `log` feature is on and a custom logger calls
 	# thread_rng while it reseeds. `log` is not enabled anywhere in this graph

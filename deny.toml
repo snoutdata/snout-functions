@@ -83,6 +83,12 @@ ignore = [
 	# own that re-exports 1.x, which the lockfile holds at the fixed 1.0.10. Flagged by version only.
 	{ id = "RUSTSEC-2026-0381", reason = "0.26.11 re-exports webpki-roots 1.0.10, the fixed release" },
 	{ id = "RUSTSEC-2026-0383", reason = "0.26.11 re-exports webpki-root-certs 1.0.10, the fixed release" },
+	# crypto-bigint 0.5.5 (2026-10-24, secret-dependent branches in constant-time arithmetic): through
+	# elliptic-curve 0.13, which deno_crypto 0.273 and deno_node_crypto 0.29 ask for; the fix is in
+	# the 0.7 line only (0.7.6, which the lockfile holds for the other copy). What it computes is
+	# WebCrypto and node:crypto P-256/P-384 a customer calls on their own keys, inside their own
+	# isolate, as the rsa entry above.
+	{ id = "RUSTSEC-2026-0387", reason = "0.5.5 via elliptic-curve 0.13 (deno_crypto); fixed only in 0.7.6, held for the 0.7 copy" },
 ]
 
 [bans]
