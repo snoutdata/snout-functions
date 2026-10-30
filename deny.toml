@@ -89,6 +89,14 @@ ignore = [
 	# WebCrypto and node:crypto P-256/P-384 a customer calls on their own keys, inside their own
 	# isolate, as the rsa entry above.
 	{ id = "RUSTSEC-2026-0387", reason = "0.5.5 via elliptic-curve 0.13 (deno_crypto); fixed only in 0.7.6, held for the 0.7 copy" },
+	# zstd 0.13.2 / zstd-safe 7.3.0 / zstd-sys 2.1.0 (2026-10-26): deno_node 0.197 pins zstd =0.13.2
+	# and the fixes are in the 0.14 line only. Its node:zlib zstd ops build each stream with
+	# Encoder::new / Decoder::new (never with_context), run it into a caller's initialised &mut [u8]
+	# (never a Vec) and return on the first error without reading the position.
+	{ id = "RUSTSEC-2026-0391", reason = "with_context never called: deno_node makes a fresh context per stream" },
+	{ id = "RUSTSEC-2026-0398", reason = "Seekable never used by deno_node" },
+	{ id = "RUSTSEC-2026-0403", reason = "Vec destination only; deno_node decodes into an initialised slice and stops on error" },
+	{ id = "RUSTSEC-2026-0410", reason = "wasm32 allocator shim only; we build for linux x86_64/aarch64" },
 ]
 
 [bans]
