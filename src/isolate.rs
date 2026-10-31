@@ -637,6 +637,51 @@ impl Drop for Metered {
 /// This container's own addresses, by name, which no worker may reach.
 const LOOPBACK: [&str; 5] = ["127.0.0.1", "localhost", "0.0.0.0", "[::1]", "[::]"];
 
+/// The certificates a worker's `fetch` and TLS sockets trust: the public web roots deno_runtime ships,
+/// and, when the runtime's own environment names a file in `DENO_CERT`, every PEM certificate in it as
+/// well. The Deno CLI reads that variable; an embedded runtime does not, so without this an isolate
+/// could never reach a server whose certificate a private CA signed (the local fleet's routers, a
+/// self-hosted stack behind its own CA). Unset, it is the public roots alone, exactly as before. Read
+/// once per process, the first time a worker needs it; a file that cannot be read or holds no
+/// certificate fails that worker's TLS with the reason, never the runtime.
+fn root_cert_store_provider() -> Arc<dyn deno_runtime::deno_tls::RootCertStoreProvider> {
+	static PROVIDER: OnceLock<Arc<dyn deno_runtime::deno_tls::RootCertStoreProvider>> = OnceLock::new();
+	PROVIDER
+		.get_or_init(|| Arc::new(EnvRoots { store: OnceLock::new() }))
+		.clone()
+}
+
+struct EnvRoots {
+	store: OnceLock<Result<deno_runtime::deno_tls::rustls::RootCertStore, String>>,
+}
+
+impl deno_runtime::deno_tls::RootCertStoreProvider for EnvRoots {
+	fn get_or_try_init(&self) -> Result<&deno_runtime::deno_tls::rustls::RootCertStore, deno_error::JsErrorBox> {
+		let store = self.store.get_or_init(|| {
+			match std::env::var_os("DENO_CERT").filter(|path| !path.is_empty()) {
+				None => roots_with(None),
+				Some(path) => std::fs::read(&path)
+					.map_err(|e| format!("DENO_CERT {}: {e}", PathBuf::from(&path).display()))
+					.and_then(|pem| roots_with(Some(&pem))),
+			}
+		});
+		store.as_ref().map_err(|e| deno_error::JsErrorBox::generic(e.clone()))
+	}
+}
+
+/// The public roots, and every certificate in `extra_pem` (one PEM file, one or more certificates).
+fn roots_with(extra_pem: Option<&[u8]>) -> Result<deno_runtime::deno_tls::rustls::RootCertStore, String> {
+	let mut store = deno_runtime::deno_tls::create_default_root_cert_store();
+	if let Some(pem) = extra_pem {
+		let certs = deno_runtime::deno_tls::load_certs(&mut std::io::BufReader::new(pem))
+			.map_err(|e| format!("DENO_CERT holds no certificate it could read: {e}"))?;
+		for cert in certs {
+			store.add(cert).map_err(|e| format!("DENO_CERT: a certificate refused: {e}"))?;
+		}
+	}
+	Ok(store)
+}
+
 /// What a worker may do: read its own bundle and its own socket directory, reach the network
 /// except this container's loopback, and nothing else. `bind` adds the one write it is ever
 /// allowed, its socket's own path, for our code to bind it before the function's code runs.
@@ -712,7 +757,7 @@ fn boot_isolate(memory_mb: u32) -> Result<Booted, String> {
 			feature_checker: Default::default(),
 			node_services: Some(crate::node::services(root.clone())),
 			npm_process_state_provider: Default::default(),
-			root_cert_store_provider: Default::default(),
+			root_cert_store_provider: Some(root_cert_store_provider()),
 			fetch_dns_resolver: Default::default(),
 			shared_array_buffer_store: Default::default(),
 			compiled_wasm_module_store: Default::default(),
@@ -854,4 +899,40 @@ fn preparation_failed(bundle: &std::path::Path) -> Option<String> {
 
 fn now_ms() -> u64 {
 	u64::try_from(crate::uptime_ms()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod roots_tests {
+	use super::roots_with;
+
+	const TEST_CA: &str = "-----BEGIN CERTIFICATE-----
+MIIBejCCASCgAwIBAgIUadW/TEDKdo7pB95AsaWJvb5tSUAwCgYIKoZIzj0EAwIw
+IjEgMB4GA1UEAwwXc25vdXQtZnVuY3Rpb25zIHRlc3QgQ0EwIBcNMjYxMDMxMTI1
+NTU3WhgPMjEyNjEwMDcxMjU1NTdaMCIxIDAeBgNVBAMMF3Nub3V0LWZ1bmN0aW9u
+cyB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEp7QM24bL4Iv3kPO7
+d01KrimCRPoDleqzEhLBSjZsJ6vErbCKkm6byrylFaL7XgXSJVP7VpW+Cu+24msL
+EoRqC6MyMDAwHQYDVR0OBBYEFNIENLpBA1BfxcbAl/4AuplYU5H1MA8GA1UdEwEB
+/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgGkyHRgptN4+7vHfMQQrscKShb+Xk
+5H2NfeGWN9OkXQsCIQDRYQFzSn9eMi5BFgIM4iPFfKHRM0Lu2JzOjGuIZcT/sg==
+-----END CERTIFICATE-----\n";
+
+	#[test]
+	fn unset_is_the_public_roots_alone() {
+		let public = deno_runtime::deno_tls::create_default_root_cert_store();
+		assert_eq!(roots_with(None).unwrap().len(), public.len());
+	}
+
+	#[test]
+	fn a_pem_file_adds_its_certificates_to_the_public_roots() {
+		let public = deno_runtime::deno_tls::create_default_root_cert_store().len();
+		assert_eq!(roots_with(Some(TEST_CA.as_bytes())).unwrap().len(), public + 1);
+		let twice = format!("{TEST_CA}{TEST_CA}");
+		assert_eq!(roots_with(Some(twice.as_bytes())).unwrap().len(), public + 2);
+	}
+
+	#[test]
+	fn a_file_with_no_certificate_is_refused_with_the_reason() {
+		let error = roots_with(Some(b"not a certificate")).unwrap_err();
+		assert!(error.contains("DENO_CERT"), "{error}");
+	}
 }
