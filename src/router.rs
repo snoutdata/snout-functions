@@ -51,8 +51,13 @@ use crate::supervisor::{GUARD_EVERY_MS, MEMORY_GUARD, MEMORY_ROOM};
 const FIRST_UID: u32 = 20_000;
 
 /// The variables a project's process is started with; everything else of this process's
-/// environment, the door's secret first, stays here.
-const PASSED: [&str; 10] = [
+/// environment, the door's secret first, stays here. `DENO_CERT` because the project's process is
+/// where each isolate's TLS roots are read (`isolate.rs`, `root_cert_store_provider`): cleared here,
+/// it was never seen, and a function still refused a private CA's server (`invalid peer certificate:
+/// UnknownIssuer`, the local fleet's routers, Lepis's rig drill 2026-10-31). A function never sees it:
+/// its `Deno.env` is its manifest's.
+const PASSED: [&str; 11] = [
+	"DENO_CERT",
 	"MALLOC_ARENA_MAX",
 	"MALLOC_MMAP_THRESHOLD_",
 	"SNOUT_FUNCTIONS_IDLE_MS",
@@ -836,7 +841,15 @@ impl Body for Passing {
 
 #[cfg(test)]
 mod tests {
-	use super::{RELAY_LINE, answered_by, prepare, relay};
+	use super::{PASSED, RELAY_LINE, answered_by, prepare, relay};
+
+	#[test]
+	fn a_projects_process_is_given_deno_cert_and_none_of_the_doors_secrets() {
+		// The isolates read their extra TLS roots in the project's process, which starts from a
+		// cleared environment: DENO_CERT must be passed, or a private CA's server is refused.
+		assert!(PASSED.contains(&"DENO_CERT"));
+		assert!(!PASSED.iter().any(|name| name.contains("SECRET") || name.contains("TOKEN") || name.contains("KEY")));
+	}
 	use std::sync::{Arc, OnceLock};
 	use std::os::unix::fs::{MetadataExt, PermissionsExt};
 	use std::path::{Path, PathBuf};

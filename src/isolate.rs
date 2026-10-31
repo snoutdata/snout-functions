@@ -931,6 +931,20 @@ EoRqC6MyMDAwHQYDVR0OBBYEFNIENLpBA1BfxcbAl/4AuplYU5H1MA8GA1UdEwEB
 	}
 
 	#[test]
+	fn a_functions_deno_env_is_its_manifests_alone_never_the_runtimes_deno_cert() {
+		// DENO_CERT reaches the project's process (router.rs PASSED) for the isolates' TLS roots; a
+		// function must never read it, nor any of the runtime's variables: its Deno.env is a store of the
+		// manifest's variables (`spec.env`, handed to INSTALL as `vars`), put in place before its code runs,
+		// and the process environment is never read for it.
+		let install = super::INSTALL;
+		assert!(install.contains("const store = new Map(Object.entries(vars));"));
+		assert!(install.contains("get: (key) => store.get(String(key)),"));
+		assert!(install.contains(r#"Object.defineProperty(Deno, "env", { configurable: true, writable: false, value: env });"#));
+		assert!(!install.contains("DENO_CERT"));
+		assert!(!install.contains("Deno.env.get"), "the store never falls back to the process's environment");
+	}
+
+	#[test]
 	fn a_file_with_no_certificate_is_refused_with_the_reason() {
 		let error = roots_with(Some(b"not a certificate")).unwrap_err();
 		assert!(error.contains("DENO_CERT"), "{error}");
