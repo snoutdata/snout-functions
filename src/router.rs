@@ -51,13 +51,8 @@ use crate::supervisor::{GUARD_EVERY_MS, MEMORY_GUARD, MEMORY_ROOM};
 const FIRST_UID: u32 = 20_000;
 
 /// The variables a project's process is started with; everything else of this process's
-/// environment, the door's secret first, stays here. `DENO_CERT` because the project's process is
-/// where each isolate's TLS roots are read (`isolate.rs`, `root_cert_store_provider`): cleared here,
-/// it was never seen, and a function still refused a private CA's server (`invalid peer certificate:
-/// UnknownIssuer`, the local fleet's routers, Lepis's rig drill 2026-10-31). A function never sees it:
-/// its `Deno.env` is its manifest's.
-const PASSED: [&str; 11] = [
-	"DENO_CERT",
+/// environment, the door's secret first, stays here. `DENO_CERT` is not among them: see `ca_env`.
+const PASSED: [&str; 10] = [
 	"MALLOC_ARENA_MAX",
 	"MALLOC_MMAP_THRESHOLD_",
 	"SNOUT_FUNCTIONS_IDLE_MS",
@@ -69,6 +64,24 @@ const PASSED: [&str; 11] = [
 	"SNOUT_FUNCTIONS_DEBUG",
 	"SNOUT_FUNCTIONS_DRAIN_MS",
 ];
+
+/// The extra TLS roots a project's process is handed, from `DENO_CERT` here: its isolates read their
+/// roots there (`isolate.rs`, `root_cert_store_provider`), and it runs chrooted into its own view, where
+/// the file `DENO_CERT` names does not exist ('No such file or directory', the local fleet drill,
+/// 2026-10-31; before that it was not passed at all, and a function refused a private CA's server with
+/// `invalid peer certificate: UnknownIssuer`). So the file is read here and its certificates handed over
+/// as `EXTRA_CA_VAR`. A file this process cannot read is handed over by its path, so the worker's TLS
+/// fails with the reason as `isolate.rs` intends. Unset: nothing, the public roots alone. A function never
+/// sees either: its `Deno.env` is its manifest's.
+fn ca_env(deno_cert: Option<std::ffi::OsString>, read: impl Fn(&std::path::Path) -> std::io::Result<Vec<u8>>) -> Vec<(&'static str, std::ffi::OsString)> {
+	match deno_cert.filter(|path| !path.is_empty()) {
+		None => Vec::new(),
+		Some(path) => match read(std::path::Path::new(&path)) {
+			Ok(pem) => vec![(crate::isolate::EXTRA_CA_VAR, std::ffi::OsString::from(String::from_utf8_lossy(&pem).into_owned()))],
+			Err(_) => vec![("DENO_CERT", path)],
+		},
+	}
+}
 
 /// A project's process, as this one holds it.
 pub struct Project {
@@ -185,6 +198,9 @@ impl Router {
 			if let Some(value) = std::env::var_os(name) {
 				command.env(name, value);
 			}
+		}
+		for (name, value) in ca_env(std::env::var_os("DENO_CERT"), |path| std::fs::read(path)) {
+			command.env(name, value);
 		}
 		let mut child = command.spawn().map_err(|error| format!("a project's process could not be started: {error}"))?;
 		let pid = child.id().unwrap_or(0);
@@ -841,14 +857,22 @@ impl Body for Passing {
 
 #[cfg(test)]
 mod tests {
-	use super::{PASSED, RELAY_LINE, answered_by, prepare, relay};
+	use super::{PASSED, RELAY_LINE, answered_by, ca_env, prepare, relay};
 
 	#[test]
-	fn a_projects_process_is_given_deno_cert_and_none_of_the_doors_secrets() {
-		// The isolates read their extra TLS roots in the project's process, which starts from a
-		// cleared environment: DENO_CERT must be passed, or a private CA's server is refused.
-		assert!(PASSED.contains(&"DENO_CERT"));
-		assert!(!PASSED.iter().any(|name| name.contains("SECRET") || name.contains("TOKEN") || name.contains("KEY")));
+	fn a_projects_process_is_handed_deno_certs_certificates_and_none_of_the_doors_secrets() {
+		// The isolates read their extra TLS roots in the project's process, which starts from a cleared
+		// environment, chrooted where DENO_CERT's file does not exist: its certificates are handed over.
+		let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+		let read_ok = |_: &std::path::Path| Ok(pem.as_bytes().to_vec());
+		assert_eq!(ca_env(Some("/etc/lf-ca/ca.crt".into()), read_ok), vec![(crate::isolate::EXTRA_CA_VAR, std::ffi::OsString::from(pem))]);
+		// A file this process cannot read goes by its path, so the worker's TLS fails with the reason.
+		let read_err = |_: &std::path::Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+		assert_eq!(ca_env(Some("/nope".into()), read_err), vec![("DENO_CERT", std::ffi::OsString::from("/nope"))]);
+		// Unset or empty: nothing, the public roots alone.
+		assert!(ca_env(None, read_ok).is_empty());
+		assert!(ca_env(Some("".into()), read_ok).is_empty());
+		assert!(!PASSED.iter().any(|name| name.contains("SECRET") || name.contains("TOKEN") || name.contains("KEY") || name.contains("CERT")));
 	}
 	use std::sync::{Arc, OnceLock};
 	use std::os::unix::fs::{MetadataExt, PermissionsExt};

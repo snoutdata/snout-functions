@@ -651,19 +651,28 @@ fn root_cert_store_provider() -> Arc<dyn deno_runtime::deno_tls::RootCertStorePr
 		.clone()
 }
 
+/// The variable a project's process is handed its extra TLS roots in, PEM text (`router.rs` `ca_env`:
+/// read there from `DENO_CERT`, whose file a chrooted process cannot see).
+pub const EXTRA_CA_VAR: &str = "SNOUT_FUNCTIONS_EXTRA_CA";
+
+/// The extra roots' PEM from this process's environment: `EXTRA_CA_VAR`'s text first, else the file
+/// `DENO_CERT` names (a runtime run in one process, unconfined). Neither: none.
+fn extra_pem(text: Option<std::ffi::OsString>, path: Option<std::ffi::OsString>) -> Option<Result<Vec<u8>, String>> {
+	if let Some(text) = text.filter(|text| !text.is_empty()) {
+		return Some(Ok(text.to_string_lossy().into_owned().into_bytes()));
+	}
+	path.filter(|path| !path.is_empty()).map(|path| std::fs::read(&path).map_err(|e| format!("DENO_CERT {}: {e}", PathBuf::from(&path).display())))
+}
+
 struct EnvRoots {
 	store: OnceLock<Result<deno_runtime::deno_tls::rustls::RootCertStore, String>>,
 }
 
 impl deno_runtime::deno_tls::RootCertStoreProvider for EnvRoots {
 	fn get_or_try_init(&self) -> Result<&deno_runtime::deno_tls::rustls::RootCertStore, deno_error::JsErrorBox> {
-		let store = self.store.get_or_init(|| {
-			match std::env::var_os("DENO_CERT").filter(|path| !path.is_empty()) {
-				None => roots_with(None),
-				Some(path) => std::fs::read(&path)
-					.map_err(|e| format!("DENO_CERT {}: {e}", PathBuf::from(&path).display()))
-					.and_then(|pem| roots_with(Some(&pem))),
-			}
+		let store = self.store.get_or_init(|| match extra_pem(std::env::var_os(EXTRA_CA_VAR), std::env::var_os("DENO_CERT")) {
+			None => roots_with(None),
+			Some(pem) => pem.and_then(|pem| roots_with(Some(&pem))),
 		});
 		store.as_ref().map_err(|e| deno_error::JsErrorBox::generic(e.clone()))
 	}
@@ -940,8 +949,18 @@ EoRqC6MyMDAwHQYDVR0OBBYEFNIENLpBA1BfxcbAl/4AuplYU5H1MA8GA1UdEwEB
 		assert!(install.contains("const store = new Map(Object.entries(vars));"));
 		assert!(install.contains("get: (key) => store.get(String(key)),"));
 		assert!(install.contains(r#"Object.defineProperty(Deno, "env", { configurable: true, writable: false, value: env });"#));
-		assert!(!install.contains("DENO_CERT"));
+		assert!(!install.contains("DENO_CERT") && !install.contains(super::EXTRA_CA_VAR));
 		assert!(!install.contains("Deno.env.get"), "the store never falls back to the process's environment");
+	}
+
+	#[test]
+	fn the_handed_certificates_come_first_then_deno_certs_file_then_none() {
+		let text = super::extra_pem(Some(TEST_CA.into()), Some("/nope".into())).unwrap().unwrap();
+		assert_eq!(roots_with(Some(&text)).unwrap().len(), deno_runtime::deno_tls::create_default_root_cert_store().len() + 1);
+		let missing = super::extra_pem(None, Some("/nope".into())).unwrap().unwrap_err();
+		assert!(missing.contains("DENO_CERT /nope"), "{missing}");
+		assert!(super::extra_pem(None, None).is_none());
+		assert!(super::extra_pem(Some("".into()), Some("".into())).is_none());
 	}
 
 	#[test]
