@@ -119,3 +119,13 @@ inherits = "release"
 lto = "off"
 codegen-units = 16
 incremental = true
+
+# SQLite 3.54.1 inside libsqlite3-sys 0.38.2 (RUSTSEC-2026-0459, CVE-2026-119375, 2026-11-10): the
+# fix is in libsqlite3-sys 0.39 with rusqlite 0.41, and every deno crate that opens SQLite (deno_kv,
+# deno_cache, deno_webstorage, deno_node_sqlite, denokv_sqlite) still asks for rusqlite ^0.40, even
+# deno_runtime 0.268. So the crate is vendored at its own version with only its bundled amalgamation
+# replaced (sqlite3.c, sqlite3.h, sqlite3ext.h from sqlite-amalgamation-3540100.zip, SHA3-256
+# 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30). Its bindings stay 3.53.2's,
+# a subset of 3.54.1. Drop this patch once deno moves to rusqlite 0.41. vendor/libsqlite3-sys/VENDORED.md.
+[patch.crates-io]
+libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
