@@ -129,3 +129,6 @@ incremental = true
 # a subset of 3.54.1. Drop this patch once deno moves to rusqlite 0.41. vendor/libsqlite3-sys/VENDORED.md.
 [patch.crates-io]
 libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+# hickory-proto 0.25.2 with 0.26.2's four fixes (RUSTSEC-2026-0487, 0489, 0490, 0491), since deno_net
+# and deno_fetch still ask for 0.25. Drop it once they move to 0.26.2. vendor/hickory-proto/VENDORED.md.
+hickory-proto = { path = "vendor/hickory-proto" }
