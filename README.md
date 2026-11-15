@@ -119,8 +119,11 @@ answers itself is JSON, `{ "message", "hint" }`:
 
 - **Health.** `GET /_snoutpod/health` answers `ok` once the port listens; it needs no secret.
 - **Metrics.** None of its own. Invocations are counted at the front door.
-- **Logs.** Standard error: a function's own `console` output, a line per worker that could not
-  start or stopped on a limit, and with `SNOUT_FUNCTIONS_DEBUG` every worker's life with timings.
+- **Logs.** Standard error: a function's own `console` output (an error its handler threw is
+  written there too), and, as `<ref>/<function>: <what>`, which the host agent files under that
+  function as an error: a worker that could not start (a module that failed to load), an error
+  nothing caught, a worker stopped at its CPU or memory limit or by the memory guard, and a
+  request past its wall clock. With `SNOUT_FUNCTIONS_DEBUG`, every worker's life with timings.
 - **Stopping.** SIGTERM: no new connection is accepted, requests in flight get
   `SNOUT_FUNCTIONS_DRAIN_MS` to finish, then it exits.
 - **Upgrading.** Replace the image. Nothing is stored: workers are rebuilt from the mount on

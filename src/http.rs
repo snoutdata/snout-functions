@@ -147,7 +147,12 @@ async fn answer(request: Request<Incoming>, state: Arc<State>) -> Reply {
 	let bundle: PathBuf = state.manifests.bundle_dir(&digest);
 	let key = Key::new(&project, &name, &digest, &manifest.env, limits);
 	let lease = match tokio::time::timeout_at(deadline, state.supervisor.lease(key, bundle, &manifest.env, deployed.concurrency)).await {
-		Err(_) => return limit_refusal("wall clock"),
+		Err(_) => {
+			// A module that has not finished loading by now is cut off with its request, and its
+			// own reason goes nowhere: this line is what the function's log has for it.
+			crate::console::say(&format!("{project}/{name}"), &crate::console::wall_clock_reached(limits.wall_ms, true));
+			return limit_refusal("wall clock");
+		}
 		Ok(Err(Refusal::Full)) => {
 			let mut reply = refuse(StatusCode::SERVICE_UNAVAILABLE, "This host is running as many functions as it can.", Some("Try again in a moment."));
 			reply.headers_mut().insert("retry-after", hyper::header::HeaderValue::from_static("1"));
@@ -165,12 +170,12 @@ async fn answer(request: Request<Incoming>, state: Arc<State>) -> Reply {
 async fn proxy(mut request: Request<Incoming>, lease: Lease, deadline: Instant) -> Reply {
 	let worker = lease.entry.worker.clone();
 	let stream = match tokio::time::timeout_at(deadline, UnixStream::connect(&worker.socket)).await {
-		Err(_) => return limit_refusal("wall clock"),
+		Err(_) => return out_of_wall_clock(&lease),
 		Ok(Err(_)) => return stopped(&lease),
 		Ok(Ok(stream)) => stream,
 	};
 	let (mut sender, connection) = match tokio::time::timeout_at(deadline, hyper::client::conn::http1::handshake(TokioIo::new(stream))).await {
-		Err(_) => return limit_refusal("wall clock"),
+		Err(_) => return out_of_wall_clock(&lease),
 		Ok(Err(_)) => return stopped(&lease),
 		Ok(Ok(pair)) => pair,
 	};
@@ -186,7 +191,7 @@ async fn proxy(mut request: Request<Incoming>, lease: Lease, deadline: Instant) 
 	*request.uri_mut() = path.parse::<Uri>().unwrap_or_default();
 	let answered = tokio::time::timeout_at(deadline, sender.send_request(request)).await;
 	let response = match answered {
-		Err(_) => return limit_refusal("wall clock"),
+		Err(_) => return out_of_wall_clock(&lease),
 		Ok(Err(_)) => return stopped(&lease),
 		Ok(Ok(response)) => response,
 	};
@@ -212,7 +217,10 @@ impl Body for Deadline {
 	fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, Error>>> {
 		let this = self.get_mut();
 		if this.sleep.as_mut().poll(cx).is_ready() {
-			this._lease = None;
+			if let Some(lease) = this._lease.take() {
+				let worker = &lease.entry.worker;
+				crate::console::say(&worker.label, &crate::console::response_cut(worker.limits.wall_ms));
+			}
 			return Poll::Ready(Some(Err("the function's wall-clock limit was reached".into())));
 		}
 		match Pin::new(&mut this.inner).poll_frame(cx) {
@@ -224,6 +232,13 @@ impl Body for Deadline {
 			Poll::Pending => Poll::Pending,
 		}
 	}
+}
+
+/// A request of this worker's past its wall clock: said in the function's log, then answered.
+fn out_of_wall_clock(lease: &Lease) -> Reply {
+	let worker = &lease.entry.worker;
+	crate::console::say(&worker.label, &crate::console::wall_clock_reached(worker.limits.wall_ms, false));
+	limit_refusal("wall clock")
 }
 
 fn stopped(lease: &Lease) -> Reply {

@@ -75,6 +75,10 @@ ignore = [
 	# system (getaddrinfo) resolver.
 	{ id = "RUSTSEC-2026-0118", reason = "hickory resolver not used: fetch resolves with getaddrinfo" },
 	{ id = "RUSTSEC-2026-0119", reason = "hickory resolver not used: fetch resolves with getaddrinfo" },
+	# hickory-resolver 0.25.2 (2026-11-12, a lookup with DNSSEC validation enabled returned bogus
+	# records as Ok): deno_net 0.251 and deno_fetch 0.283 ask for it with features tokio and serde
+	# only, so neither dnssec-ring nor dnssec-aws-lc-rs is on and validation is not compiled in.
+	{ id = "RUSTSEC-2026-0514", reason = "DNSSEC validation is not compiled in: no dnssec feature on hickory-resolver" },
 	# rsa (Marvin): no fixed release exists. Reached only by node:crypto RSA decryption a
 	# customer calls on their own keys, inside their own isolate.
 	{ id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; customer-invoked node:crypto only" },

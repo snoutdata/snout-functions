@@ -102,6 +102,42 @@ fn attributed(printer: &mut Printer, msg: &str, is_err: bool, now: Instant, at_m
 	Some(format!("{line}\n"))
 }
 
+/// A line about one of a function's workers or requests in the runtime's own words:
+/// `<ref>/<function>: <what>`, `label` being the worker's (`Spec::label`). The host agent files a
+/// line of that shape, from the project's own process, under that function as an error, with any
+/// indented lines after it (a stack) as part of it.
+/// This is how the function's log hears what the function never printed: a module that did not
+/// load, an error nothing caught, a limit it reached. Not counted against the worker's rate: it
+/// comes once per stopped worker or failed request, never in a loop of the function's.
+pub fn said(label: &str, what: &str) -> String {
+	format!("{label}: {what}")
+}
+
+/// `said`, on stderr.
+pub fn say(label: &str, what: &str) {
+	eprintln!("{}", said(label, what));
+}
+
+/// What a function's log says when one of its requests ran out of wall clock. `starting`: the
+/// request was still waiting for the function's worker to start (a module slow to load).
+pub fn wall_clock_reached(wall_ms: u64, starting: bool) -> String {
+	if starting {
+		format!("A request reached its wall clock limit of {wall_ms} ms while the function was starting, and was answered 500.")
+	} else {
+		format!("A request reached its wall clock limit of {wall_ms} ms, and was answered 500.")
+	}
+}
+
+/// What a function's log says when its response was still being sent at the wall clock.
+pub fn response_cut(wall_ms: u64) -> String {
+	format!("A response was cut off at its wall clock limit of {wall_ms} ms.")
+}
+
+/// What a function's log says when its worker was stopped at its own memory limit.
+pub fn memory_reached(memory_mb: u32) -> String {
+	format!("Stopped by the runtime: it reached its memory limit of {memory_mb} MB.")
+}
+
 /// `op_print`, attributed. Same arguments and result, so it drops in without a change to the
 /// JavaScript that calls it.
 #[op2(fast)]
@@ -163,6 +199,36 @@ mod tests {
 		let long = "é".repeat(MAX_LINE);
 		let (kept, was_cut) = cut(&long);
 		assert!(was_cut && kept.len() <= MAX_LINE && kept.chars().all(|c| c == 'é'));
+	}
+
+	/// The shape the host agent collects a runtime line by (`functionLogs.ts`, `WORKER_LINE`): a
+	/// ref, `/`, a function name, `: `, then the text, on one line.
+	fn collected(line: &str) -> Option<(&str, &str, &str)> {
+		let (label, what) = line.split_once(": ")?;
+		let (project, function) = label.split_once('/')?;
+		let ref_ok = !project.is_empty() && project.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+		let name_ok = function.len() <= 48
+			&& function.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+			&& function.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+		(ref_ok && name_ok && !what.is_empty() && !line.contains('\n')).then_some((project, function, what))
+	}
+
+	#[test]
+	fn what_the_runtime_says_is_filed_under_the_function() {
+		for what in [wall_clock_reached(10_000, false), wall_clock_reached(10_000, true), response_cut(10_000), memory_reached(128)] {
+			let line = said("k80jpgmdgv0ds/send-mail", &what);
+			assert_eq!(collected(&line), Some(("k80jpgmdgv0ds", "send-mail", what.as_str())), "{line}");
+			// User-facing: a person reads it in the Logs tab.
+			assert!(!what.contains('\u{2014}'), "{what}");
+		}
+	}
+
+	#[test]
+	fn the_limit_lines_name_the_limit() {
+		assert!(wall_clock_reached(2_500, false).contains("2500 ms"));
+		assert!(wall_clock_reached(2_500, true).contains("while the function was starting"));
+		assert!(response_cut(2_500).contains("2500 ms"));
+		assert!(memory_reached(256).contains("256 MB"));
 	}
 
 	#[test]

@@ -615,6 +615,11 @@ async fn run(booted: Booted, spec: Spec, ready: Ready) {
 		}
 	}
 	heartbeat.abort();
+	// Its own memory limit, unlike the CPU meter and the memory guard, says nothing where it is
+	// reached (a V8 callback, an allocator), so it is said here, once, for the function's log.
+	if stopped_because.lock().ok().is_some_and(|held| held.as_deref() == Some("memory")) {
+		crate::console::say(&spec.label, &crate::console::memory_reached(spec.limits.memory_mb));
+	}
 	// Dropping the worker disposes of the isolate and closes its server, so every request it
 	// held is answered by the supervisor with the reason, now rather than at its wall clock.
 	drop(worker);
